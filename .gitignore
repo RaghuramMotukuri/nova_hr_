@@ -1,0 +1,27 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# ChromaDB vector store (generated at runtime)
+chroma_db/
+chroma_test/
+
+# User data (uploaded documents — never commit private files)
+data/
+
+# Lock files
+uv.lock
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
