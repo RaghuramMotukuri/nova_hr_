@@ -64,6 +64,46 @@ python -m venv .venv
 source .venv/bin/activate
 ```
 
+## How It Works
+ 
+Documents are chunked once, then indexed on **two parallel tracks**: a keyword-based BM25 index for exact term matches, and a dense-vector Chroma index (via `all-MiniLM-L6-v2` embeddings) for conceptual/semantic matches. Every query runs against both, and results are displayed independently so you can compare retrieval strategies directly.
+ 
+```mermaid
+flowchart TD
+    A["📁 User documents<br/><small>.txt / .pdf / .docx</small>"] --> B["✂️ Document loading & chunking<br/><small>PyPDFLoader · TextLoader · Docx2txtLoader</small>"]
+ 
+    B --> C["🔤 BM25 Okapi index<br/><small>Lexical / keyword tokens</small>"]
+    B --> D["🧠 SentenceTransformer embeddings<br/><small>all-MiniLM-L6-v2</small>"]
+    D --> E["🗄️ ChromaDB vector store<br/><small>Persistent local index (./chroma_db)</small>"]
+ 
+    F["❓ User query"] --> G["🔤 BM25 lexical search"]
+    F --> H["🧠 Semantic vector search<br/><small>cosine similarity</small>"]
+ 
+    C -.indexed against.-> G
+    E -.indexed against.-> H
+ 
+    G --> I["📊 Top-K lexical results<br/><small>file, chunk, BM25 score</small>"]
+    H --> J["📊 Top-K semantic results<br/><small>file, chunk, similarity score</small>"]
+ 
+    I --> K["🖥️ Streamlit UI<br/><small>side-by-side comparison tabs</small>"]
+    J --> K
+ 
+    style A fill:#EEEDFE,stroke:#534AB7,color:#26215C
+    style B fill:#F1EFE8,stroke:#5F5E5A,color:#2C2C2A
+    style C fill:#E1F5EE,stroke:#0F6E56,color:#04342C
+    style D fill:#FAECE7,stroke:#993C1D,color:#4A1B0C
+    style E fill:#FAECE7,stroke:#993C1D,color:#4A1B0C
+    style F fill:#F1EFE8,stroke:#5F5E5A,color:#2C2C2A
+    style G fill:#E1F5EE,stroke:#0F6E56,color:#04342C
+    style H fill:#FAECE7,stroke:#993C1D,color:#4A1B0C
+    style I fill:#E1F5EE,stroke:#0F6E56,color:#04342C
+    style J fill:#FAECE7,stroke:#993C1D,color:#4A1B0C
+    style K fill:#EEEDFE,stroke:#534AB7,color:#26215C
+```
+ 
+> Diagram renders automatically on GitHub. If your viewer doesn't support Mermaid, see the plain-text version in [`docs/pipeline.txt`](#) or open this README on GitHub directly.
+ 
+
 ### 2. Install Dependencies
 
 Install the required minimal packages:
