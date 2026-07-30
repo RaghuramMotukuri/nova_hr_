@@ -90,6 +90,7 @@ class HybridRetriever:
         rerank_top_n: int = 5,
         semantic_limit: int = 20,
         lexical_limit: int = 20,
+        max_providers: int = 3,
     ) -> Dict[str, Any]:
         """
         Execute the full hybrid retrieval & answer generation pipeline for a query.
@@ -182,6 +183,7 @@ class HybridRetriever:
             query=query,
             chunks=response["reranked"],
             company=company,
+            max_providers=max_providers,
         )
 
         return response

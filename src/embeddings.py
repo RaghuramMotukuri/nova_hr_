@@ -135,8 +135,12 @@ class EmbeddingPipeline:
     def sync_vector_store(self, chunks: List[Any], force_reload: bool = False) -> None:
         """Upsert chunks into Firestore (idempotent via content-hash IDs)."""
         # Invalidate BM25 cache so new docs are picked up on next search
-        self._bm25_cache.clear()
+        self.invalidate_bm25_cache()
         self.vector_store.upload_policy_chunks(chunks, force_reload=force_reload)
+
+    def invalidate_bm25_cache(self) -> None:
+        """Clear cached BM25 indexes so deleted or modified files are refreshed."""
+        self._bm25_cache.clear()
 
     # ── BM25 cache helpers ────────────────────────────────────────────────────
     def _get_bm25_index(

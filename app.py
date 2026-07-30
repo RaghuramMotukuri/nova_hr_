@@ -1,7 +1,7 @@
 """
 app.py – LOVA_HR | Firebase-Powered Hybrid RAG Engine
-BM25 Lexical + Firestore Semantic (BGE-M3) + RRF Fusion + BGE Reranker V2 M3.
-Organized by company and subfolders. No generative LLM — 100% retrieval-based.
+BM25 Lexical + Firestore Semantic (BGE-M3) + RRF Fusion + BGE Reranker + Phi-3.5-mini-instruct.
+Organized by company and subfolders. Full RAG pipeline with Hugging Face generation.
 """
 import streamlit as st
 import os
@@ -266,6 +266,75 @@ st.markdown(
 )
 
 # ── Helper to render single-tab output and references ───────────────────────
+# Provider style registry (mirrors generator.py _PROVIDERS)
+_PROVIDER_STYLES: Dict[str, Dict[str, str]] = {
+    "phi35": {
+        "label":      "Phi-3.5-mini-instruct",
+        "icon":       "🧠",
+        "color":      "#38bdf8",
+        "bg":         "rgba(56,189,248,0.06)",
+        "border":     "#38bdf8",
+        "glow":       "rgba(56,189,248,0.18)",
+        "badge_bg":   "rgba(56,189,248,0.15)",
+    },
+    "groq": {
+        "label":      "llama-3.1-8b-instant",
+        "icon":       "⚡",
+        "color":      "#a78bfa",
+        "bg":         "rgba(167,139,250,0.06)",
+        "border":     "#a78bfa",
+        "glow":       "rgba(167,139,250,0.18)",
+        "badge_bg":   "rgba(167,139,250,0.15)",
+    },
+    "extractive": {
+        "label":      "Extractive Grounded Baseline",
+        "icon":       "📋",
+        "color":      "#34d399",
+        "bg":         "rgba(52,211,153,0.06)",
+        "border":     "#34d399",
+        "glow":       "rgba(52,211,153,0.14)",
+        "badge_bg":   "rgba(52,211,153,0.12)",
+    },
+}
+
+_PROVIDER_BADGE: Dict[str, str] = {
+    "phi35":      "HF Serverless",
+    "groq":       "Llama 3.1",
+    "extractive": "Extractive",
+}
+
+
+def _render_answer_card(
+    answer_text: str,
+    provider_key: str,
+    card_index: int,
+) -> None:
+    """Render a single provider answer card with its accent color scheme."""
+    style = _PROVIDER_STYLES.get(provider_key, _PROVIDER_STYLES["extractive"])
+    badge = _PROVIDER_BADGE.get(provider_key, "Free Tier")
+    safe_text = html.escape(answer_text).replace("\n", "<br>")
+    st.markdown(
+        f'<div style="'
+        f'background: linear-gradient(135deg, rgba(15,23,42,0.97), {style["bg"]}); '
+        f'border: 1px solid {style["border"]}; border-radius: 12px; '
+        f'padding: 1.2rem 1.3rem; margin-bottom: 1rem; '
+        f'box-shadow: 0 4px 22px {style["glow"]};">'
+        f'<div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.9rem;">'
+        f'<span style="font-weight:700; color:{style["color"]}; font-size:1rem;">'
+        f'{style["icon"]} Output #{card_index} \u2014 {style["label"]}'
+        f'</span>'
+        f'<span style="background:{style["badge_bg"]}; color:{style["color"]}; '
+        f'padding:0.2rem 0.65rem; border-radius:20px; font-size:0.72rem; '
+        f'font-weight:600; letter-spacing:0.03em;">{badge}</span>'
+        f'</div>'
+        f'<div style="color:#e2e8f0; font-size:0.93rem; line-height:1.7;">'
+        f'{safe_text}'
+        f'</div>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+
 def render_single_view_results(
     reranked_results: List[Dict[str, Any]],
     lexical_results: List[Dict[str, Any]],
@@ -273,60 +342,152 @@ def render_single_view_results(
     generation: Optional[Dict[str, Any]] = None,
 ) -> None:
     """
-    Render output and reference information in a single unified container without multiple tabs.
-    Shows grounded answer/snippet along with source metadata (company, subfolder, filename, score).
+    Render the full RAG output:
+      1. Multiple AI answer cards  — one per provider (Phi-3.5, Groq, Extractive)
+      2. Cited Sources table       — shared across all answers
+      3. Semantic Search Results   — Firestore BGE-M3 vector results (collapsible)
+      4. Reranked Reference Chunks — grounded source passages
     """
-    if generation and generation.get("answer"):
-        provider = generation.get("provider", "LLM")
-        ans_text = generation.get("answer", "")
-        st.markdown(
-            f'<div style="background: linear-gradient(135deg, rgba(30, 41, 59, 0.9), rgba(15, 23, 42, 0.95)); border: 1px solid #38bdf8; border-radius: 12px; padding: 1.2rem; margin-bottom: 1.2rem; box-shadow: 0 4px 20px rgba(56, 189, 248, 0.15);">'
-            f'<div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.8rem;">'
-            f'<span style="font-weight:700; color:#38bdf8; font-size:1.05rem;">🤖 LOVA_HR AI Policy Answer</span>'
-            f'<span style="background:rgba(56,189,248,0.15); color:#38bdf8; padding:0.25rem 0.6rem; border-radius:20px; font-size:0.75rem; font-weight:600;">{provider}</span>'
-            f'</div>'
-            f'<div style="color:#e2e8f0; font-size:0.95rem; line-height:1.6;">{ans_text}</div>'
-            f'</div>',
-            unsafe_allow_html=True,
-        )
+    # ── Multiple AI Answer Cards ──────────────────────────────────────────────
+    if generation:
+        answers = generation.get("answers", [])
+        citations = generation.get("citations", [])
 
+        # Fallback: wrap legacy flat format into list
+        if not answers and generation.get("answer") and generation.get("provider", "none") != "none":
+            answers = [{"provider_key": "phi35", "answer": generation["answer"]}]
+
+        if answers:
+            # Section header
+            n_cards = len(answers)
+            st.markdown(
+                f'<div style="display:flex; align-items:center; gap:0.6rem; '
+                f'margin-bottom:0.9rem; margin-top:0.3rem;">'
+                f'<span style="font-size:1rem; font-weight:800; color:#f1f5f9;">🤖 LOVA_HR Answers</span>'
+                f'<span style="background:rgba(99,102,241,0.18); color:#a5b4fc; '
+                f'padding:0.15rem 0.55rem; border-radius:20px; font-size:0.73rem; font-weight:600;">'
+                f'{n_cards} output{"s" if n_cards != 1 else ""}</span>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+
+            # Render ALL answer cards directly visible on page
+            if len(answers) >= 2:
+                cols = st.columns(min(len(answers), 3))
+                for col, item in zip(cols, answers):
+                    idx = answers.index(item) + 1
+                    style = _PROVIDER_STYLES.get(item["provider_key"], _PROVIDER_STYLES["extractive"])
+                    badge = _PROVIDER_BADGE.get(item["provider_key"], "Free Tier")
+                    safe_text = html.escape(item["answer"]).replace("\n", "<br>")
+                    with col:
+                        st.markdown(
+                            f'<div style="background:linear-gradient(135deg,rgba(15,23,42,0.97),{style["bg"]}); '
+                            f'border:1px solid {style["border"]}; border-radius:12px; '
+                            f'padding:1.15rem; margin-bottom:0.8rem; '
+                            f'box-shadow:0 4px 18px {style["glow"]};">'
+                            f'<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:0.7rem;">'
+                            f'<span style="font-weight:700;color:{style["color"]};font-size:0.92rem;">'
+                            f'{style["icon"]} #{idx} {style["label"]}</span>'
+                            f'<span style="background:{style["badge_bg"]};color:{style["color"]};'
+                            f'padding:0.15rem 0.5rem;border-radius:20px;font-size:0.68rem;font-weight:600;">{badge}</span>'
+                            f'</div>'
+                            f'<div style="color:#e2e8f0;font-size:0.89rem;line-height:1.65;">{safe_text}</div>'
+                            f'</div>',
+                            unsafe_allow_html=True,
+                        )
+            else:
+                for idx, item in enumerate(answers, 1):
+                    _render_answer_card(item["answer"], item["provider_key"], idx)
+
+            # Shared Cited Sources table
+            if citations:
+                cite_rows = "".join(
+                    f'<tr>'
+                    f'<td style="color:#94a3b8;padding:0.18rem 0.6rem;font-size:0.78rem;">#{c["rank"]}</td>'
+                    f'<td style="color:#cbd5e1;padding:0.18rem 0.6rem;font-size:0.78rem;">'
+                    f'🏢 {html.escape(str(c["company"]))} &gt; '
+                    f'📁 {html.escape(str(c["subfolder"]))} &gt; '
+                    f'📄 {html.escape(str(c["filename"]))}</td>'
+                    f'<td style="color:#64748b;padding:0.18rem 0.6rem;font-size:0.78rem;">p.{c["page"]}</td>'
+                    f'<td style="color:#475569;padding:0.18rem 0.6rem;font-size:0.72rem;">'
+                    f'Score: {float(c.get("score",0)):.3f}</td>'
+                    f'</tr>'
+                    for c in citations
+                )
+                st.markdown(
+                    f'<div style="background:rgba(15,23,42,0.8);border:1px solid rgba(255,255,255,0.06);'
+                    f'border-radius:10px;padding:0.8rem 1rem;margin-bottom:1.2rem;">'
+                    f'<div style="font-size:0.75rem;font-weight:700;color:#94a3b8;'
+                    f'margin-bottom:0.5rem;text-transform:uppercase;letter-spacing:0.05em;">📎 Cited Sources (shared)</div>'
+                    f'<table style="width:100%;border-collapse:collapse;">{cite_rows}</table>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+
+    # ── Semantic Search Results (BGE-M3 / Firestore) ──────────────────────────
+    if semantic_results:
+        with st.expander(
+            f"🔵 Semantic Search Results ({len(semantic_results)} chunks · BGE-M3 · Firestore)",
+            expanded=False,
+        ):
+            for i, res in enumerate(semantic_results, 1):
+                escaped_text = html.escape(res.get("chunk_text", ""))
+                comp  = html.escape(res.get("company",  "General"))
+                sub   = html.escape(res.get("subfolder","General"))
+                fname = html.escape(res.get("filename", "document"))
+                dist  = res.get("distance", res.get("score", None))
+                score_badge = f"Cosine Sim: {float(1 - dist):.4f}" if dist is not None else "Semantic Match"
+                st.markdown(
+                    f'<div class="result-card semantic-card">'
+                    f'<div class="card-header">'
+                    f'<span class="doc-badge">#{i} | 🏢 {comp} &gt; 📁 {sub} &gt; 📄 {fname}</span>'
+                    f'<span class="score-badge semantic-score">{score_badge}</span>'
+                    f'</div>'
+                    f'<div class="card-body">{escaped_text}</div>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+
+    # ── Grounded References & Source Chunks (Collapsible Dropdown Tab) ────────
     results = reranked_results if reranked_results else (semantic_results if semantic_results else lexical_results)
 
     if not results:
         st.info("No matching document context found for this query.")
         return
 
-    st.markdown("### 📄 Grounded References & Source Chunks")
-    for i, res in enumerate(results, 1):
-        escaped_text = html.escape(res.get("chunk_text", ""))
-        comp = html.escape(res.get("company", "General"))
-        sub = html.escape(res.get("subfolder", "General"))
-        fname = html.escape(res.get("filename", "document"))
-        src = html.escape(res.get("source_file", "—"))
+    with st.expander(f"📄 Grounded References & Source Chunks ({len(results)} chunks)", expanded=False):
+        for i, res in enumerate(results, 1):
+            escaped_text = html.escape(res.get("chunk_text", ""))
+            comp  = html.escape(res.get("company",  "General"))
+            sub   = html.escape(res.get("subfolder","General"))
+            fname = html.escape(res.get("filename", "document"))
+            src   = html.escape(res.get("source_file", "—"))
 
-        r_score = res.get("reranker_score")
-        if r_score is not None:
-            score_badge = f"Reranker: {float(r_score):.4f}"
-        elif "rrf_score" in res:
-            score_badge = f"RRF: {float(res['rrf_score']):.4f}"
-        elif "score" in res:
-            score_badge = f"Score: {float(res['score']):.2f}"
-        else:
-            score_badge = "Relevance: Match"
+            r_score = res.get("reranker_score")
+            if r_score is not None:
+                score_badge = f"Reranker: {float(r_score):.4f}"
+            elif "rrf_score" in res:
+                score_badge = f"RRF: {float(res['rrf_score']):.4f}"
+            elif "score" in res:
+                score_badge = f"Score: {float(res['score']):.2f}"
+            else:
+                score_badge = "Relevance: Match"
 
-        st.markdown(
-            f'<div class="result-card reranked-card">'
-            f'<div class="card-header">'
-            f'<span class="doc-badge">#{i} | 🏢 {comp} &gt; 📁 {sub} &gt; 📄 {fname}</span>'
-            f'<span class="score-badge reranked-score">{score_badge}</span>'
-            f'</div>'
-            f'<div class="card-body">{escaped_text}</div>'
-            f'<div style="font-size:0.75rem; color:#94a3b8; margin-top:0.6rem; border-top:1px solid rgba(255,255,255,0.08); padding-top:0.4rem;">'
-            f'<strong>Reference Source:</strong> {src}'
-            f'</div>'
-            f'</div>',
-            unsafe_allow_html=True
-        )
+            st.markdown(
+                f'<div class="result-card reranked-card">'
+                f'<div class="card-header">'
+                f'<span class="doc-badge">#{i} | 🏢 {comp} &gt; 📁 {sub} &gt; 📄 {fname}</span>'
+                f'<span class="score-badge reranked-score">{score_badge}</span>'
+                f'</div>'
+                f'<div class="card-body">{escaped_text}</div>'
+                f'<div style="font-size:0.75rem; color:#94a3b8; margin-top:0.6rem; '
+                f'border-top:1px solid rgba(255,255,255,0.08); padding-top:0.4rem;">'
+                f'<strong>Reference Source:</strong> {src}'
+                f'</div>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+
 
 # ── Document Setup & State ───────────────────────────────────────────────────
 DATA_DIR = Path("data")
@@ -353,6 +514,16 @@ retriever = get_retriever()
 
 # Firebase connection status (checked once per session)
 _firebase_status = is_firebase_available()
+
+
+def reindex_knowledge_base(data_dir: Path = DATA_DIR) -> None:
+    """Reload all documents from data_dir, chunk them, and sync with vector store."""
+    docs = load_all_documents(data_dir)
+    if docs:
+        chunks = pipeline.chunk_documents(docs)
+        pipeline.sync_vector_store(chunks)
+    else:
+        pipeline.invalidate_bm25_cache()
 
 # Helpers
 def get_existing_companies(data_dir: Path = DATA_DIR) -> List[str]:
@@ -571,6 +742,27 @@ with st.sidebar:
             "Top Chunks to Retrieve", 1, 5, 3,
             help="Number of context passages to retrieve for Lexical and Semantic searches separately."
         )
+        st.divider()
+        st.markdown("**AI Answer Settings**")
+        max_providers = st.slider(
+            "Total Answer Outputs",
+            min_value=1,
+            max_value=3,
+            value=3,
+            step=1,
+            help=(
+                "Adjust how many total model outputs to generate and display:\n"
+                "1 → 🧠 Phi-3.5-mini-instruct\n"
+                "2 → 🧠 Phi-3.5 + ⚡ Llama-3.1\n"
+                "3 → 🧠 Phi-3.5 + ⚡ Llama-3.1 + 📋 Extractive Baseline"
+            ),
+        )
+        provider_labels = {
+            1: "1 Output: 🧠 Phi-3.5-mini-instruct",
+            2: "2 Outputs: 🧠 Phi-3.5 + ⚡ Llama-3.1",
+            3: "3 Outputs: 🧠 Phi-3.5 + ⚡ Llama-3.1 + 📋 Extractive",
+        }
+        st.caption(provider_labels.get(max_providers, ""))
 
     # ──────────────────────────────────────────
     # TAB 2: ADD DOCUMENTS (UPLOADER)
@@ -866,7 +1058,7 @@ st.markdown(
     """
     <div class="hero-container">
         <h1 class="hero-title">LOVA_HR ⚡</h1>
-        <div class="hero-subtitle">Firebase · BGE-M3 · RRF Fusion · BGE Reranker · Zero Hallucinations</div>
+        <div class="hero-subtitle">Firebase · BGE-M3 · RRF Fusion · BGE Reranker · Phi-3.5-mini-instruct</div>
     </div>
     """,
     unsafe_allow_html=True,
@@ -901,12 +1093,14 @@ for idx, msg in enumerate(st.session_state.messages):
             lexical_results  = msg.get("lexical_results", [])
             semantic_results = msg.get("semantic_results", [])
             reranked_results = msg.get("reranked_results", [])
+            generation       = msg.get("generation", {})
 
-            if lexical_results or semantic_results or reranked_results:
+            if lexical_results or semantic_results or reranked_results or generation:
                 render_single_view_results(
                     reranked_results=reranked_results,
                     lexical_results=lexical_results,
                     semantic_results=semantic_results,
+                    generation=generation,
                 )
 
 # Chat Input Handler
@@ -930,25 +1124,28 @@ if query := st.chat_input("Ask a question about the documents in scope…"):
                 "error": None,
             })
         else:
-            with st.spinner("🔍 Querying Firebase + BM25 + BGE Reranker…"):
+            with st.spinner("🔍 Querying Firebase · BM25 · BGE Reranker · Phi-3.5-mini-instruct…"):
                 search_response = retriever.search(
                     query=query,
                     top_k=top_k,
                     company=search_company,
                     subfolder=search_subfolder,
                     rerank_top_n=5,
+                    max_providers=max_providers,
                 )
                 lexical_results  = search_response["lexical"]
                 semantic_results = search_response["semantic"]
                 reranked_results = search_response["reranked"]
+                generation       = search_response.get("generation", {})
 
             if search_response.get("error"):
                 st.error(search_response["error"])
-                
+
             render_single_view_results(
                 reranked_results=reranked_results,
                 lexical_results=lexical_results,
                 semantic_results=semantic_results,
+                generation=generation,
             )
 
             # Save response to history
@@ -958,5 +1155,6 @@ if query := st.chat_input("Ask a question about the documents in scope…"):
                 "lexical_results":  lexical_results,
                 "semantic_results": semantic_results,
                 "reranked_results": reranked_results,
+                "generation":       generation,
                 "error": search_response.get("error"),
             })
