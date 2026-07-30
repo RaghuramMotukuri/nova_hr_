@@ -343,4 +343,5 @@ class EmbeddingPipeline:
             entry["reranker_score"] = float(reranker_score)
             results.append(entry)
 
+
         return results
