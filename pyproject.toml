@@ -1,11 +1,16 @@
 [project]
 name = "lova-hr"
-version = "0.1.0"
-description = "LOVA_HR — Hybrid Lexical + Semantic RAG Engine"
+version = "2.0.0"
+description = "LOVA_HR — Firebase + BGE-M3 Hybrid RAG Engine (BM25 + Firestore + RRF + BGE Reranker)"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "chromadb>=0.5.0",
+    "firebase-admin>=6.5.0",
+    "google-cloud-firestore>=2.19.0",
+    "torch>=2.0.0",
+    "transformers>=4.44.0",
+    "sentence-transformers>=3.0.1",
+    "FlagEmbedding>=1.2.10",
     "docx2txt>=0.9",
     "langchain>=0.3.0",
     "langchain-community>=0.3.0",
@@ -16,7 +21,6 @@ dependencies = [
     "pypdf>=4.0.0",
     "python-dotenv>=1.0.0",
     "rank-bm25>=0.2.2",
-    "sentence-transformers>=2.7.0",
     "streamlit>=1.35.0",
 ]
 

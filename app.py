@@ -1,9 +1,15 @@
 """
-app.py – LOVA_HR | Hybrid Lexical + Semantic Scoped RAG Engine
-Pure retrieval mode — organized by company and subfolders. No external LLMs used.
+app.py – LOVA_HR | Firebase-Powered Hybrid RAG Engine
+BM25 Lexical + Firestore Semantic (BGE-M3) + RRF Fusion + BGE Reranker V2 M3.
+Organized by company and subfolders. No generative LLM — 100% retrieval-based.
 """
 import streamlit as st
 import os
+
+# ── Environment & Performance Optimization Flags ───────────────────────────
+os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "1"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
 import shutil
 import stat
 import hashlib
@@ -46,6 +52,8 @@ def _safe_rmtree(path: Path, retries: int = 3, delay: float = 0.5) -> None:
             return
 
 from src.embeddings import EmbeddingPipeline
+from src.retriever import HybridRetriever
+from src.config import is_firebase_available
 from src.data_loader import load_all_documents
 
 # ── Page config ───────────────────────────────────────────────────────────────
@@ -131,6 +139,10 @@ st.markdown(
     .semantic-card {
         border-left-color: #6366f1; /* Indigo accent */
     }
+    .reranked-card {
+        border-left-color: #f59e0b; /* Amber accent — top quality results */
+        background: rgba(245, 158, 11, 0.04);
+    }
     .card-header {
         display: flex;
         justify-content: space-between;
@@ -160,11 +172,36 @@ st.markdown(
         color: #e0e7ff;
         background: rgba(99, 102, 241, 0.15);
     }
+    .reranked-score {
+        color: #fef3c7;
+        background: rgba(245, 158, 11, 0.20);
+    }
     .card-body {
         color: #e2e8f0;
         font-size: 0.88rem;
         line-height: 1.6;
         white-space: pre-wrap;
+    }
+    /* Firebase status badge */
+    .firebase-badge {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.3rem;
+        font-size: 0.75rem;
+        font-weight: 600;
+        padding: 0.25rem 0.6rem;
+        border-radius: 20px;
+        letter-spacing: 0.03em;
+    }
+    .firebase-online {
+        background: rgba(34, 197, 94, 0.15);
+        border: 1px solid rgba(34, 197, 94, 0.3);
+        color: #86efac;
+    }
+    .firebase-offline {
+        background: rgba(239, 68, 68, 0.15);
+        border: 1px solid rgba(239, 68, 68, 0.3);
+        color: #fca5a5;
     }
 
     /* Sidebar Styling */
@@ -228,6 +265,69 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+# ── Helper to render single-tab output and references ───────────────────────
+def render_single_view_results(
+    reranked_results: List[Dict[str, Any]],
+    lexical_results: List[Dict[str, Any]],
+    semantic_results: List[Dict[str, Any]],
+    generation: Optional[Dict[str, Any]] = None,
+) -> None:
+    """
+    Render output and reference information in a single unified container without multiple tabs.
+    Shows grounded answer/snippet along with source metadata (company, subfolder, filename, score).
+    """
+    if generation and generation.get("answer"):
+        provider = generation.get("provider", "LLM")
+        ans_text = generation.get("answer", "")
+        st.markdown(
+            f'<div style="background: linear-gradient(135deg, rgba(30, 41, 59, 0.9), rgba(15, 23, 42, 0.95)); border: 1px solid #38bdf8; border-radius: 12px; padding: 1.2rem; margin-bottom: 1.2rem; box-shadow: 0 4px 20px rgba(56, 189, 248, 0.15);">'
+            f'<div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.8rem;">'
+            f'<span style="font-weight:700; color:#38bdf8; font-size:1.05rem;">🤖 LOVA_HR AI Policy Answer</span>'
+            f'<span style="background:rgba(56,189,248,0.15); color:#38bdf8; padding:0.25rem 0.6rem; border-radius:20px; font-size:0.75rem; font-weight:600;">{provider}</span>'
+            f'</div>'
+            f'<div style="color:#e2e8f0; font-size:0.95rem; line-height:1.6;">{ans_text}</div>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+
+    results = reranked_results if reranked_results else (semantic_results if semantic_results else lexical_results)
+
+    if not results:
+        st.info("No matching document context found for this query.")
+        return
+
+    st.markdown("### 📄 Grounded References & Source Chunks")
+    for i, res in enumerate(results, 1):
+        escaped_text = html.escape(res.get("chunk_text", ""))
+        comp = html.escape(res.get("company", "General"))
+        sub = html.escape(res.get("subfolder", "General"))
+        fname = html.escape(res.get("filename", "document"))
+        src = html.escape(res.get("source_file", "—"))
+
+        r_score = res.get("reranker_score")
+        if r_score is not None:
+            score_badge = f"Reranker: {float(r_score):.4f}"
+        elif "rrf_score" in res:
+            score_badge = f"RRF: {float(res['rrf_score']):.4f}"
+        elif "score" in res:
+            score_badge = f"Score: {float(res['score']):.2f}"
+        else:
+            score_badge = "Relevance: Match"
+
+        st.markdown(
+            f'<div class="result-card reranked-card">'
+            f'<div class="card-header">'
+            f'<span class="doc-badge">#{i} | 🏢 {comp} &gt; 📁 {sub} &gt; 📄 {fname}</span>'
+            f'<span class="score-badge reranked-score">{score_badge}</span>'
+            f'</div>'
+            f'<div class="card-body">{escaped_text}</div>'
+            f'<div style="font-size:0.75rem; color:#94a3b8; margin-top:0.6rem; border-top:1px solid rgba(255,255,255,0.08); padding-top:0.4rem;">'
+            f'<strong>Reference Source:</strong> {src}'
+            f'</div>'
+            f'</div>',
+            unsafe_allow_html=True
+        )
+
 # ── Document Setup & State ───────────────────────────────────────────────────
 DATA_DIR = Path("data")
 if not DATA_DIR.exists():
@@ -239,12 +339,20 @@ if "chunks" not in st.session_state:
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-# Cache pipeline model loading
-@st.cache_resource
-def get_pipeline():
+# Cache pipeline and retriever (model loading is expensive)
+@st.cache_resource(show_spinner="Loading HR Search Engine & Models...")
+def get_pipeline() -> EmbeddingPipeline:
     return EmbeddingPipeline()
 
+@st.cache_resource(show_spinner="Loading HR Search Engine & Models...")
+def get_retriever() -> HybridRetriever:
+    return HybridRetriever(pipeline=get_pipeline())
+
 pipeline = get_pipeline()
+retriever = get_retriever()
+
+# Firebase connection status (checked once per session)
+_firebase_status = is_firebase_available()
 
 # Helpers
 def get_existing_companies(data_dir: Path = DATA_DIR) -> List[str]:
@@ -320,7 +428,7 @@ def load_and_chunk_cached(doc_hash: str) -> List[Any]:
     return pipeline.chunk_documents(docs)
 
 def reindex_knowledge_base(force_clear: bool = False):
-    """Load, chunk, and index the current set of documents."""
+    """Load, chunk, and index the current set of documents into Firestore."""
     if force_clear:
         pipeline.vector_store.clear()
         st.cache_data.clear()
@@ -332,12 +440,14 @@ def reindex_knowledge_base(force_clear: bool = False):
         st.session_state.doc_hash = current_hash
         return
 
-    with st.spinner("⏳ Updating search indexes..."):
+    with st.spinner("⏳ Updating search indexes (Firestore + BM25)..."):
         # Fast cached chunk retrieval (instant if doc_hash is unchanged)
         chunks = load_and_chunk_cached(current_hash)
-        # Sync Vector DB (idempotent, skips existing)
+        # Sync to Firestore (idempotent, skips existing chunks)
         pipeline.sync_vector_store(chunks)
-        
+        # Invalidate BM25 cache so new docs are picked up
+        pipeline.invalidate_bm25_cache()
+
         # Save to session state
         st.session_state.chunks = chunks
         st.session_state.doc_hash = current_hash
@@ -569,17 +679,18 @@ with st.sidebar:
         with st.form("create_company_form", clear_on_submit=True):
             st.markdown("Create New Company")
             raw_comp = st.text_input("Company Name")
-            if st.form_submit_button("Create Company", use_container_width=True):
+            if st.form_submit_button("✨ Create Company", use_container_width=True, type="primary"):
                 new_comp = sanitize_folder_name(raw_comp)
                 if new_comp:
-                    # Create default general subfolder to create the path
+                    # Create default general subfolder on local disk
                     (DATA_DIR / new_comp / "General").mkdir(parents=True, exist_ok=True)
-                    st.success(f"Company '{new_comp}' created!")
+                    st.cache_data.clear()
+                    reindex_knowledge_base()
+                    st.toast(f"Created company '{new_comp}' on local disk & Firebase!")
                     st.rerun()
                 else:
                     st.error("Please enter a valid company name.")
-                    
-        # Rename or Delete Subfolders
+
         companies = get_existing_companies()
         if companies:
             st.divider()
@@ -590,6 +701,21 @@ with st.sidebar:
 
             manage_comp = st.selectbox("Select Company", companies, key="manage_comp")
             
+            # Form to Create Subfolder in Selected Company
+            with st.form("create_subfolder_form", clear_on_submit=True):
+                st.markdown(f"Create New Subfolder in '{manage_comp}'")
+                raw_sub = st.text_input("Subfolder Name")
+                if st.form_submit_button("✨ Create Subfolder", use_container_width=True):
+                    new_sub = sanitize_folder_name(raw_sub)
+                    if new_sub:
+                        (DATA_DIR / manage_comp / new_sub).mkdir(parents=True, exist_ok=True)
+                        st.cache_data.clear()
+                        reindex_knowledge_base()
+                        st.toast(f"Created subfolder '{new_sub}' in '{manage_comp}' on local disk & Firebase!")
+                        st.rerun()
+                    else:
+                        st.error("Please enter a valid subfolder name.")
+
             # Reset manage_sub if manage_comp changes
             if "last_manage_comp" not in st.session_state:
                 st.session_state.last_manage_comp = manage_comp
@@ -601,19 +727,22 @@ with st.sidebar:
             # Delete Company Button
             if st.button("🗑️ Delete Company", type="secondary", use_container_width=True):
                 comp_dir = DATA_DIR / manage_comp
-                # 1. Delete all vector chunks of this company directly from ChromaDB
+                # 1. Delete all vector chunks for this company from Firebase & memory
                 pipeline.vector_store.delete_company_chunks(manage_comp)
-                
-                # 2. Delete company directory
+
+                # 2. Delete company directory from local disk
                 if comp_dir.exists():
                     _safe_rmtree(comp_dir)
-                
-                # 3. Clean session state keys for the deleted company
+
+                # 3. Invalidate BM25 cache
+                pipeline.invalidate_bm25_cache()
+
+                # 4. Clean session state keys for the deleted company
                 for key in ["manage_comp", "upload_company", "search_company"]:
                     if key in st.session_state and st.session_state[key] == manage_comp:
                         del st.session_state[key]
 
-                st.toast(f"Deleted company '{manage_comp}'")
+                st.toast(f"Deleted company '{manage_comp}' from local disk & Firebase")
                 st.cache_data.clear()
                 reindex_knowledge_base()
                 st.rerun()
@@ -628,8 +757,6 @@ with st.sidebar:
             
             # Delete Subfolder Button
             if st.button("🗑️ Delete Subfolder", type="secondary", use_container_width=True):
-                # Guard: "General" is the virtual default — deleting it would orphan
-                # all root-level company documents from ChromaDB without removing files.
                 if manage_sub == "General":
                     st.error(
                         "'General' is the default subfolder and cannot be deleted. "
@@ -637,23 +764,40 @@ with st.sidebar:
                     )
                 else:
                     sub_dir = DATA_DIR / manage_comp / manage_sub
-                    # 1. Delete all vector chunks of this subfolder directly from ChromaDB
+                    # 1. Delete all vector chunks for this subfolder from Firebase & memory
                     pipeline.vector_store.delete_subfolder_chunks(manage_comp, manage_sub)
 
-                    # 2. Delete subfolder directory from disk
+                    # 2. Delete subfolder directory from local disk
                     if sub_dir.exists():
                         _safe_rmtree(sub_dir)
 
-                    # 3. Clean session state keys for the deleted subfolder
+                    # 3. Invalidate BM25 cache
+                    pipeline.invalidate_bm25_cache()
+
+                    # 4. Clean session state keys for the deleted subfolder
                     for key in ["manage_sub", "upload_subfolder", "search_subfolder"]:
                         if key in st.session_state and st.session_state[key] == manage_sub:
                             del st.session_state[key]
 
-                    st.toast(f"Deleted subfolder '{manage_sub}' from '{manage_comp}'")
+                    st.toast(f"Deleted subfolder '{manage_sub}' from '{manage_comp}' on local disk & Firebase")
                     st.cache_data.clear()
                     reindex_knowledge_base()
                     st.rerun()
                 
+    # ── Firebase Status Indicator ─────────────────────────────────────────────
+    st.divider()
+    if _firebase_status:
+        st.markdown(
+            '<span class="firebase-badge firebase-online">🔥 Firebase Connected</span>',
+            unsafe_allow_html=True,
+        )
+    else:
+        st.markdown(
+            '<span class="firebase-badge firebase-offline">⚠️ Firebase Offline (BM25 only)</span>',
+            unsafe_allow_html=True,
+        )
+        st.caption("Place `serviceAccountKey.json` in repo root to enable semantic search.")
+
     # ── Document Library View (Sidebar Bottom) ────────────────────────────────
     st.divider()
     st.markdown("**Document Library**")
@@ -704,9 +848,11 @@ with st.sidebar:
                         with col_del:
                             if st.button("❌", key=f"del_{comp}_{sub}_{path.name}", help=f"Delete {path.name}"):
                                 try:
-                                    # 1. Delete from vector DB using absolute path
+                                    # 1. Delete from Firestore using absolute path
                                     pipeline.vector_store.delete_file_chunks(str(path.resolve()))
-                                    # 2. Delete file
+                                    # 2. Invalidate BM25 cache
+                                    pipeline.invalidate_bm25_cache()
+                                    # 3. Delete file
                                     if path.exists():
                                         path.unlink()
                                     st.toast(f"Removed {raw_name}")
@@ -720,7 +866,7 @@ st.markdown(
     """
     <div class="hero-container">
         <h1 class="hero-title">LOVA_HR ⚡</h1>
-        <div class="hero-subtitle">Zero-LLM Company-Scoped RAG Engine</div>
+        <div class="hero-subtitle">Firebase · BGE-M3 · RRF Fusion · BGE Reranker · Zero Hallucinations</div>
     </div>
     """,
     unsafe_allow_html=True,
@@ -749,46 +895,19 @@ for idx, msg in enumerate(st.session_state.messages):
         else:
             if msg.get("content"):
                 st.warning(msg["content"])
-            
-            lexical_results = msg.get("lexical_results", [])
+            if msg.get("error"):
+                st.error(msg["error"])
+
+            lexical_results  = msg.get("lexical_results", [])
             semantic_results = msg.get("semantic_results", [])
-            
-            if lexical_results or semantic_results:
-                tab_lex, tab_sem = st.tabs(["🔍 Lexical Retrieval (BM25)", "🧠 Semantic Retrieval (Dense Vector)"])
-                
-                with tab_lex:
-                    if not lexical_results:
-                        st.info("No matching lexical context found.")
-                    else:
-                        for i, res in enumerate(lexical_results, 1):
-                            escaped_text = html.escape(res["chunk_text"])
-                            st.markdown(
-                                f'<div class="result-card lexical-card">'
-                                f'<div class="card-header">'
-                                f'<span class="doc-badge">#{i} | {res["company"]} > {res["subfolder"]} > {res["filename"]}</span>'
-                                f'<span class="score-badge lexical-score">BM25: {res["score"]:.2f}</span>'
-                                f'</div>'
-                                f'<div class="card-body">{escaped_text}</div>'
-                                f'</div>',
-                                unsafe_allow_html=True
-                            )
-                            
-                with tab_sem:
-                    if not semantic_results:
-                        st.info("No matching semantic context found.")
-                    else:
-                        for i, res in enumerate(semantic_results, 1):
-                            escaped_text = html.escape(res["chunk_text"])
-                            st.markdown(
-                                f'<div class="result-card semantic-card">'
-                                f'<div class="card-header">'
-                                f'<span class="doc-badge">#{i} | {res["company"]} > {res["subfolder"]} > {res["filename"]}</span>'
-                                f'<span class="score-badge semantic-score">Similarity: {res["score"]*100:.1f}%</span>'
-                                f'</div>'
-                                f'<div class="card-body">{escaped_text}</div>'
-                                f'</div>',
-                                unsafe_allow_html=True
-                            )
+            reranked_results = msg.get("reranked_results", [])
+
+            if lexical_results or semantic_results or reranked_results:
+                render_single_view_results(
+                    reranked_results=reranked_results,
+                    lexical_results=lexical_results,
+                    semantic_results=semantic_results,
+                )
 
 # Chat Input Handler
 if query := st.chat_input("Ask a question about the documents in scope…"):
@@ -800,73 +919,44 @@ if query := st.chat_input("Ask a question about the documents in scope…"):
         
     # Assistant turn
     with st.chat_message("assistant"):
-        if not st.session_state.chunks:
+        if not st.session_state.chunks and not _firebase_status:
             st.warning("Document library is empty. Please upload documents in the sidebar first.")
             st.session_state.messages.append({
                 "role": "assistant",
                 "content": "Document library is empty. Please upload documents in the sidebar first.",
                 "lexical_results": [],
-                "semantic_results": []
+                "semantic_results": [],
+                "reranked_results": [],
+                "error": None,
             })
         else:
-            with st.spinner("🔍 Querying scoped database…"):
-                # Scoped Lexical Search
-                lexical_results = pipeline.lexical_search(
-                    query=query,
-                    chunks=st.session_state.chunks,
-                    top_k=top_k,
-                    company=search_company,
-                    subfolder=search_subfolder
-                )
-                
-                # Scoped Semantic Search
-                semantic_results = pipeline.semantic_search(
+            with st.spinner("🔍 Querying Firebase + BM25 + BGE Reranker…"):
+                search_response = retriever.search(
                     query=query,
                     top_k=top_k,
                     company=search_company,
-                    subfolder=search_subfolder
+                    subfolder=search_subfolder,
+                    rerank_top_n=5,
                 )
+                lexical_results  = search_response["lexical"]
+                semantic_results = search_response["semantic"]
+                reranked_results = search_response["reranked"]
+
+            if search_response.get("error"):
+                st.error(search_response["error"])
                 
-            tab_lex, tab_sem = st.tabs(["🔍 Lexical Retrieval (BM25)", "🧠 Semantic Retrieval (Dense Vector)"])
-            
-            with tab_lex:
-                if not lexical_results:
-                    st.info("No matching lexical context found.")
-                else:
-                    for i, res in enumerate(lexical_results, 1):
-                        escaped_text = html.escape(res["chunk_text"])
-                        st.markdown(
-                            f'<div class="result-card lexical-card">'
-                            f'<div class="card-header">'
-                            f'<span class="doc-badge">#{i} | {res["company"]} > {res["subfolder"]} > {res["filename"]}</span>'
-                            f'<span class="score-badge lexical-score">BM25: {res["score"]:.2f}</span>'
-                            f'</div>'
-                            f'<div class="card-body">{escaped_text}</div>'
-                            f'</div>',
-                            unsafe_allow_html=True
-                        )
-                        
-            with tab_sem:
-                if not semantic_results:
-                    st.info("No matching semantic context found.")
-                else:
-                    for i, res in enumerate(semantic_results, 1):
-                        escaped_text = html.escape(res["chunk_text"])
-                        st.markdown(
-                            f'<div class="result-card semantic-card">'
-                            f'<div class="card-header">'
-                            f'<span class="doc-badge">#{i} | {res["company"]} > {res["subfolder"]} > {res["filename"]}</span>'
-                            f'<span class="score-badge semantic-score">Similarity: {res["score"]*100:.1f}%</span>'
-                            f'</div>'
-                            f'<div class="card-body">{escaped_text}</div>'
-                            f'</div>',
-                            unsafe_allow_html=True
-                        )
-            
+            render_single_view_results(
+                reranked_results=reranked_results,
+                lexical_results=lexical_results,
+                semantic_results=semantic_results,
+            )
+
             # Save response to history
             st.session_state.messages.append({
                 "role": "assistant",
                 "content": "",
-                "lexical_results": lexical_results,
-                "semantic_results": semantic_results
+                "lexical_results":  lexical_results,
+                "semantic_results": semantic_results,
+                "reranked_results": reranked_results,
+                "error": search_response.get("error"),
             })

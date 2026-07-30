@@ -8,11 +8,13 @@ from pathlib import Path
 from typing import List, Any, Dict
 
 
-def extract_metadata_from_path(fpath: Path, data_dir: Path) -> Dict[str, str]:
+def extract_metadata_from_path(fpath: Path | str, data_dir: Path | str) -> Dict[str, Any]:
     """
     Extract company, subfolder, and filename from the file path.
     Assumes structure: data_dir / company_name / subfolder_name / filename
     """
+    fpath = Path(fpath)
+    data_dir = Path(data_dir)
     try:
         relative_path = fpath.resolve().relative_to(data_dir.resolve())
         parts = relative_path.parts
@@ -36,9 +38,13 @@ def extract_metadata_from_path(fpath: Path, data_dir: Path) -> Dict[str, str]:
         
     return {
         "company": company,
+        "company_id": company,
         "subfolder": subfolder,
         "filename": filename,
+        "document_id": filename,
         "source": str(fpath.resolve()),
+        "page": 1,
+        "page_number": 1,
     }
 
 
@@ -80,24 +86,43 @@ def load_all_documents(data_dir: str = "data") -> List[Any]:
                         # even if an exception is raised mid-loop (prevents WinError 5
                         # when the folder is later deleted with shutil.rmtree).
                         with fitz.open(str(fpath)) as doc_pdf:
-                            for page_num, page in enumerate(doc_pdf):
-                                text = page.get_text()
-                                if text and text.strip():
-                                    page_meta = meta.copy()
-                                    page_meta["page"] = page_num + 1
-                                    documents.append(Document(page_content=text, metadata=page_meta))
+                            if doc_pdf.is_encrypted:
+                                try:
+                                    doc_pdf.authenticate("")
+                                except Exception:
+                                    pass
+                            for page_num in range(len(doc_pdf)):
+                                try:
+                                    page = doc_pdf[page_num]
+                                    text = page.get_text("text")
+                                    if not text or not text.strip():
+                                        blocks = page.get_text("blocks")
+                                        text = "\n".join([b[4] for b in blocks if len(b) >= 5 and isinstance(b[4], str)])
+                                    if text and text.strip():
+                                        page_meta = meta.copy()
+                                        page_meta["page"] = page_num + 1
+                                        page_meta["page_number"] = page_num + 1
+                                        documents.append(Document(page_content=text.strip(), metadata=page_meta))
+                                except Exception as page_exc:
+                                    print(f"[DataLoader] Notice: error reading page {page_num + 1} of '{fpath.name}': {page_exc}")
                     except Exception as fitz_exc:
                         print(f"[DataLoader] PyMuPDF notice for '{fpath.name}': {fitz_exc} - using PyPDFLoader fallback")
                         from langchain_community.document_loaders import PyPDFLoader
                         docs = PyPDFLoader(str(fpath)).load()
                         for d in docs:
+                            pdf_page = d.metadata.get("page", 0) + 1 if isinstance(d.metadata.get("page"), int) else 1
                             d.metadata.update(meta)
+                            d.metadata["page"] = pdf_page
+                            d.metadata["page_number"] = pdf_page
                         documents.extend(docs)
                 else:
                     from langchain_community.document_loaders import PyPDFLoader
                     docs = PyPDFLoader(str(fpath)).load()
                     for d in docs:
+                        pdf_page = d.metadata.get("page", 0) + 1 if isinstance(d.metadata.get("page"), int) else 1
                         d.metadata.update(meta)
+                        d.metadata["page"] = pdf_page
+                        d.metadata["page_number"] = pdf_page
                     documents.extend(docs)
             except Exception as exc:
                 print(f"[DataLoader] [Warning] Skipping '{fpath.name}': {exc}")
@@ -150,7 +175,7 @@ def load_all_documents(data_dir: str = "data") -> List[Any]:
 
 if __name__ == "__main__":
     docs = load_all_documents("data")
-    print(f"\n✅ Loaded {len(docs)} document(s).")
+    print(f"\n[DataLoader] Loaded {len(docs)} document(s).")
     if docs:
         print("First document metadata:", docs[0].metadata)
         print("Preview:", docs[0].page_content[:200], "...")

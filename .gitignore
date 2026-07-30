@@ -9,9 +9,15 @@ wheels/
 # Virtual environments
 .venv
 
-# ChromaDB vector store (generated at runtime)
+# ChromaDB vector store (generated at runtime, kept for legacy reference)
 chroma_db/
 chroma_test/
+
+# Firebase credentials (NEVER commit — contains your private key!)
+serviceAccountKey.json
+*firebase-adminsdk*.json
+*.json.key
+.env
 
 # User data (uploaded documents — never commit private files)
 data/

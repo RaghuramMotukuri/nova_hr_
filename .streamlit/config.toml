@@ -1,0 +1,8 @@
+[server]
+folderWatchBlacklist = [".venv", "venv", "site-packages"]
+
+[runner]
+fastReruns = true
+
+[browser]
+gatherUsageStats = false
