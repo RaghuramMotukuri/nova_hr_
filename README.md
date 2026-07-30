@@ -1,218 +1,213 @@
-# LOVA_HR ⚡
+<div align="center">
 
-**Firebase-Powered Hybrid RAG Engine — BM25 + Firestore Vector Search + BGE Reranker**
+# ⚡ NOVA_HR
 
-LOVA_HR is a high-performance, hallucination-free document RAG application built on **Google Cloud Firestore** as the online vector database, **BAAI/bge-m3** for 1024-dimensional dense embeddings, **BM25 Okapi** for lexical retrieval, **Reciprocal Rank Fusion (RRF)** for hybrid result merging, and **BAAI/bge-reranker-v2-m3** for cross-encoder reranking.
+### Pure Lexical + Semantic Retrieval RAG Engine — **Zero LLM**
 
-It uses **zero generative LLMs** — every answer is grounded in verbatim retrieved document chunks, guaranteeing 100% factual accuracy with zero hallucinations.
+**Ask questions about your HR policy documents and get exact, verifiable answers — no hallucinations, no API keys, no cloud calls.**
 
----
+![Zero LLM](https://img.shields.io/badge/LLM-ZERO-red?style=for-the-badge)
+![Python](https://img.shields.io/badge/Python-3.10+-3776AB?style=for-the-badge&logo=python&logoColor=white)
+![Streamlit](https://img.shields.io/badge/Streamlit-UI-FF4B4B?style=for-the-badge&logo=streamlit&logoColor=white)
+![ChromaDB](https://img.shields.io/badge/ChromaDB-Vector%20Store-4A154B?style=for-the-badge)
+![License](https://img.shields.io/badge/Privacy-100%25%20Local-2ea44f?style=for-the-badge)
 
-## Key Features
-
-- 🔥 **Google Cloud Firestore** — Online, scalable vector store with native 1024-dim cosine similarity search.
-- 🧠 **BAAI/bge-m3 Embeddings** — State-of-the-art 1024-dimensional multilingual dense vectors.
-- 🔤 **BM25 Lexical Search** — Exact keyword matching for policy section numbers, form IDs, and legal jargon.
-- ⚡ **RRF Hybrid Fusion** — Reciprocal Rank Fusion merges semantic + lexical results for best-of-both retrieval.
-- 🏆 **BGE Reranker V2 M3** — Cross-encoder reranking scores the top-15 fused candidates to surface the top-5 most relevant chunks.
-- 📁 **Dynamic Document Library** — Upload `.txt`, `.pdf`, `.docx` files through the web UI.
-- ⚖️ **Three-Tab Results View** — BM25 | Semantic (BGE-M3) | Reranked (RRF + BGE) for full pipeline transparency.
-- 🔒 **Company + Subfolder Scoping** — Searches are always scoped to the selected company and subfolder.
-- 💻 **Offline Fallback** — Gracefully degrades to BM25-only mode if Firebase is unreachable.
+</div>
 
 ---
 
-## Architecture
+## 🧭 What Is This?
 
-```
-[ User Documents (.txt / .pdf / .docx) ]
-                    │
-                    ▼
-           [ Text Chunking (800 chars / 150 overlap) ]
-                    │
-         ┌──────────┴──────────┐
-         ▼                     ▼
-   [ BGE-M3 Embeddings ]   [ Keywords ]
-         │                     │
-         ▼                     │
-  [ Firestore Vector Store ]   │
-  (1024-dim cosine index)      │
-         │                     │
-         └──────────┬──────────┘
-                    │
-            [ User Query ]
-                    │
-         ┌──────────┴──────────┐
-         ▼                     ▼
-  [ Firestore find_nearest ]  [ BM25 Okapi ]
-    Branch A: Semantic          Branch B: Lexical
-    (Top-20)                    (Top-20)
-         │                     │
-         └──────────┬──────────┘
-                    ▼
-           [ RRF Fusion: Σ 1/(60 + rank) ]
-                    │
-             [ Top-15 candidates ]
-                    │
-        [ BGE Reranker V2 M3 CrossEncoder ]
-                    │
-             [ Top-5 Reranked Chunks ]
-                    │
-          [ Streamlit 3-Tab UI ]
-     BM25 | Semantic | 🏆 Reranked
-```
+Most HR chatbots wrap an LLM around your documents and hope it doesn't make something up.
+
+**NOVA_HR does the opposite.** It never generates a single word of new text. Instead, it retrieves the *exact* chunk of your uploaded HR policy that answers the question — combining classic keyword search (BM25) with modern semantic embedding search (SentenceTransformers + ChromaDB) — and shows you both, side by side, with real scores. If it's not in the document, it doesn't invent an answer.
+
+| Traditional LLM Chatbot | NOVA_HR |
+|---|---|
+| 🌀 Can hallucinate facts | ✅ 100% grounded in your documents |
+| ☁️ Needs an API key + internet | 🖥️ Fully local, zero external calls |
+| 💸 Per-token API cost | 🆓 Free to run, forever |
+| 🔒 Sends data to a third party | 🔐 Your HR data never leaves your machine |
+| 🤷 Hard to explain *why* it answered | 📊 Shows exact source chunk + score |
 
 ---
 
-## Setup
+## 🏗️ The Pipeline — How a Question Becomes an Answer
 
-### 1. Set Up Virtual Environment
-
-```bash
-python -m venv .venv
-.venv\Scripts\activate        # Windows
-source .venv/bin/activate     # macOS / Linux
-```
-
-## How It Works
- 
-Documents are chunked once, then indexed on **two parallel tracks**: a keyword-based BM25 index for exact term matches, and a dense-vector Chroma index (via `all-MiniLM-L6-v2` embeddings) for conceptual/semantic matches. Every query runs against both, and results are displayed independently so you can compare retrieval strategies directly.
- 
 ```mermaid
 flowchart TD
-    A["📁 User documents<br/><small>.txt / .pdf / .docx</small>"] --> B["✂️ Document loading & chunking<br/><small>PyPDFLoader · TextLoader · Docx2txtLoader</small>"]
- 
-    B --> C["🔤 BM25 Okapi index<br/><small>Lexical / keyword tokens</small>"]
-    B --> D["🧠 SentenceTransformer embeddings<br/><small>all-MiniLM-L6-v2</small>"]
-    D --> E["🗄️ ChromaDB vector store<br/><small>Persistent local index (./chroma_db)</small>"]
- 
-    F["❓ User query"] --> G["🔤 BM25 lexical search"]
-    F --> H["🧠 Semantic vector search<br/><small>cosine similarity</small>"]
- 
-    C -.indexed against.-> G
-    E -.indexed against.-> H
- 
-    G --> I["📊 Top-K lexical results<br/><small>file, chunk, BM25 score</small>"]
-    H --> J["📊 Top-K semantic results<br/><small>file, chunk, similarity score</small>"]
- 
-    I --> K["🖥️ Streamlit UI<br/><small>side-by-side comparison tabs</small>"]
-    J --> K
- 
-    style A fill:#EEEDFE,stroke:#534AB7,color:#26215C
-    style B fill:#F1EFE8,stroke:#5F5E5A,color:#2C2C2A
-    style C fill:#E1F5EE,stroke:#0F6E56,color:#04342C
-    style D fill:#FAECE7,stroke:#993C1D,color:#4A1B0C
-    style E fill:#FAECE7,stroke:#993C1D,color:#4A1B0C
-    style F fill:#F1EFE8,stroke:#5F5E5A,color:#2C2C2A
-    style G fill:#E1F5EE,stroke:#0F6E56,color:#04342C
-    style H fill:#FAECE7,stroke:#993C1D,color:#4A1B0C
-    style I fill:#E1F5EE,stroke:#0F6E56,color:#04342C
-    style J fill:#FAECE7,stroke:#993C1D,color:#4A1B0C
-    style K fill:#EEEDFE,stroke:#534AB7,color:#26215C
-```
- 
-> Diagram renders automatically on GitHub. If your viewer doesn't support Mermaid, see the plain-text version in [`docs/pipeline.txt`](#) or open this README on GitHub directly.
- 
+    A["📄 User Documents<br/>.txt / .pdf / .docx"] --> B["✂️ Text Chunking"]
 
-### 2. Install Dependencies
+    B --> C["🔤 BM25 Okapi Index<br/><i>Lexical / Keyword Search</i>"]
+    B --> D["🧠 SentenceTransformer Embeddings<br/><i>all-MiniLM-L6-v2</i>"]
+    D --> E["🗂️ ChromaDB Vector Store<br/><i>Persistent, local, incremental</i>"]
+
+    F["❓ User Query"] --> C
+    F --> D
+
+    C --> G["🏆 Top-K Lexical Matches"]
+    E --> H["🏆 Top-K Semantic Matches"]
+
+    G --> I["⚖️ Side-by-Side Comparison View"]
+    H --> I
+
+    I --> J["🖥️ Streamlit UI<br/>Files • Chunk Text • Scores"]
+
+    style A fill:#fff3cd,stroke:#856404
+    style F fill:#d1ecf1,stroke:#0c5460
+    style J fill:#d4edda,stroke:#155724
+    style I fill:#f8d7da,stroke:#721c24
+```
+
+**In plain words:**
+
+1. 📁 **You upload** HR policy documents (`.txt`, `.pdf`, `.docx`) through the web UI.
+2. ✂️ Each document is **split into chunks** small enough to search precisely, large enough to keep context.
+3. Every chunk is indexed **two different ways at once**:
+   - 🔤 **Lexical** — BM25 builds a keyword-frequency index (great for exact terms: "12 days", "probation period").
+   - 🧠 **Semantic** — MiniLM turns each chunk into a vector embedding stored in ChromaDB (great for meaning: "how much time off do I get" ≈ "leave entitlement").
+4. ❓ When you ask a question, it's run through **both engines simultaneously**.
+5. ⚖️ The **top matches from each side** are displayed in separate tabs — you see exactly which chunk, from which file, with its score, for both approaches.
+6. 🚫 No generation step. No LLM. What you see *is* what's in the document.
+
+---
+
+## 🔄 Incremental Indexing — Only New Docs Get Processed
+
+```mermaid
+flowchart LR
+    A["📤 New file uploaded"] --> B{"Already embedded<br/>in ChromaDB?"}
+    B -- "Yes ✅" --> C["⏭️ Skip re-embedding"]
+    B -- "No 🆕" --> D["✂️ Chunk → 🧠 Embed → 💾 Store"]
+    E["🗑️ Delete file"] --> F["🧹 Prune from index"]
+
+    style B fill:#fff3cd,stroke:#856404
+    style D fill:#d4edda,stroke:#155724
+    style F fill:#f8d7da,stroke:#721c24
+```
+
+This keeps the app fast as your document library grows — you're never re-embedding the whole knowledge base just to add one new policy PDF.
+
+---
+
+## 🧰 Tech Stack
+
+```mermaid
+flowchart TB
+    subgraph UI["🖥️ Interface"]
+        S["Streamlit"]
+    end
+    subgraph Ingest["📥 Document Loading"]
+        L1["PyPDFLoader"]
+        L2["TextLoader"]
+        L3["Docx2txtLoader"]
+    end
+    subgraph Retrieval["🔍 Dual Retrieval Engine"]
+        R1["Rank-BM25<br/>(BM25Okapi)"]
+        R2["SentenceTransformers<br/>all-MiniLM-L6-v2"]
+    end
+    subgraph Store["💾 Storage"]
+        V["ChromaDB<br/>(persistent, local: ./chroma_db)"]
+    end
+
+    S --> Ingest
+    Ingest --> Retrieval
+    R2 --> V
+    Retrieval --> S
+    V --> S
+```
+
+| Layer | Technology | Purpose |
+|---|---|---|
+| 🖥️ **Frontend / UI** | Streamlit | Upload docs, ask questions, view results |
+| 📥 **Document Loading** | LangChain Community Loaders (`PyPDFLoader`, `TextLoader`, `Docx2txtLoader`) | Parse `.pdf` / `.txt` / `.docx` into text |
+| 🧠 **Embeddings** | SentenceTransformers — `all-MiniLM-L6-v2` | Runs **locally**, converts text chunks to dense vectors |
+| 🗂️ **Vector Database** | ChromaDB | Persistent local semantic index (`./chroma_db`) |
+| 🔤 **Lexical Engine** | Rank-BM25 (`BM25Okapi`) | Classic keyword/term-frequency search |
+| 🧪 **Testing** | Pytest | Verifies loading, indexing, search, and deletion |
+
+---
+
+## ✨ Feature Highlights
+
+<table>
+<tr>
+<td width="50%" valign="top">
+
+### 🧠 Zero LLM Dependency
+No OpenAI, no Anthropic, no cloud generative model anywhere in the loop. No API keys, no per-query cost, no risk of the model "creatively" answering a compliance question wrong.
+
+### 📁 Dynamic Document Library
+Add or remove `.txt`, `.pdf`, `.docx` files straight from the web UI — the knowledge base updates live, no restart required.
+
+### 🔤 Lexical Search (BM25)
+Fast, exact keyword and term matching — ideal for policy numbers, exact phrases, and legal-style precision.
+
+</td>
+<td width="50%" valign="top">
+
+### 🧠 Semantic Search (Dense Vectors)
+Cosine-similarity search over embeddings — finds the right policy even when the question is phrased completely differently from the source text.
+
+### ⚖️ Side-by-Side Comparison View
+Every query shows **both** retrieval methods in responsive tabs — file name, chunk text, and precise similarity/score — so you can see *why* an answer was surfaced.
+
+### ⚡ Incremental Vector Indexing
+Already-embedded documents are automatically skipped on re-index, keeping the app fast as the library grows.
+
+</td>
+</tr>
+</table>
+
+---
+
+## 🚀 Getting Started
 
 ```bash
+# 1️⃣ Create & activate a virtual environment
+python -m venv .venv
+source .venv/bin/activate        # macOS/Linux
+.venv\Scripts\activate           # Windows
+
+# 2️⃣ Install dependencies
 pip install -r requirements.txt
-```
 
-> **Note:** First-time install downloads `BAAI/bge-m3` (~570 MB) and `BAAI/bge-reranker-v2-m3` (~580 MB) from HuggingFace.
-
-### 3. Configure Firebase Credentials
-
-**Option A — Local file (recommended for development):**
-1. Go to [Firebase Console](https://console.firebase.google.com) → Project Settings → Service Accounts
-2. Click **Generate new private key** → save as `serviceAccountKey.json` in the repo root.
-
-**Option B — Environment variable (recommended for CI/CD):**
-```bash
-export FIREBASE_SERVICE_ACCOUNT_KEY='<paste contents of serviceAccountKey.json>'
-```
-
-Copy the template:
-```bash
-cp .env.example .env   # then fill in your values
-```
-
-### 4. Create Firestore Vector Index
-
-Run this **once** before first use (index creation takes 5–15 minutes):
-
-```bash
-gcloud firestore indexes composite create \
-  --project=YOUR_PROJECT_ID \
-  --collection-group=hr_policies \
-  --query-scope=COLLECTION \
-  --field-config field-path=embedding,vector-config='{"dimension":"1024","flat":{}}'
-```
-
-Check index status:
-```bash
-gcloud firestore indexes composite list --project=YOUR_PROJECT_ID
-```
-
-### 5. Ingest Documents into Firestore
-
-```bash
-# Ingest all documents from data/ directory
-python ingest_firebase.py
-
-# Clear existing data and re-ingest
-python ingest_firebase.py --clear
-
-# Test chunking without uploading (dry run)
-python ingest_firebase.py --dry-run
-```
-
-### 6. Run the App
-
-```bash
+# 3️⃣ Launch the app
 streamlit run app.py
 ```
 
----
+App opens at **`http://localhost:8501`** 🎉
 
-## Running Tests
+### 🧪 Run the Test Suite
 
 ```bash
 pytest tests/ -v
 ```
 
----
-
-## Tech Stack
-
-| Component | Technology |
-|-----------|-----------|
-| **Frontend UI** | Streamlit |
-| **Vector Database** | Google Cloud Firestore (native vector search) |
-| **Embedding Model** | `BAAI/bge-m3` (1024-dim, via FlagEmbedding) |
-| **Lexical Engine** | Rank-BM25 (`BM25Okapi`) |
-| **Hybrid Fusion** | Reciprocal Rank Fusion (RRF, k=60) |
-| **Reranker** | `BAAI/bge-reranker-v2-m3` (CrossEncoder) |
-| **Document Loading** | LangChain Loaders + PyMuPDF |
-| **Firebase SDK** | `firebase-admin` + `google-cloud-firestore` |
+Covers file loading, indexing, lexical + semantic search, and incremental deletion.
 
 ---
 
-## Project Structure
+## 📂 Project Structure
 
 ```
-lova-hr/
-├── app.py                  # Streamlit UI (3-tab results: BM25 | Semantic | Reranked)
-├── ingest_firebase.py      # CLI: parse docs → embed → upload to Firestore
-├── requirements.txt        # Python dependencies
-├── .env.example            # Environment variable template
-├── serviceAccountKey.json  # 🔒 Firebase credentials (git-ignored!)
-└── src/
-    ├── config.py           # Firebase Admin SDK initialization
-    ├── firebase_client.py  # FirestoreVectorStore (BGE-M3 + Firestore native search)
-    ├── embeddings.py       # EmbeddingPipeline (BM25 + Semantic + RRF + Rerank)
-    ├── retriever.py        # HybridRetriever (clean search orchestration)
-    ├── data_loader.py      # PDF / TXT / DOCX loader with metadata
-    └── vectorstore.py      # Legacy ChromaDB store (retained for reference)
+nova_hr_/
+├── app.py              # 🖥️ Streamlit UI entry point
+├── main.py             # ⚙️ Core pipeline logic
+├── src/                # 🧩 Retrieval + indexing modules
+├── data/                # 📄 Uploaded HR documents
+├── chroma_db/           # 🗂️ Persistent vector store
+├── chroma_test/         # 🧪 Test vector store
+├── tests/               # ✅ Pytest suite
+├── requirements.txt      # 📦 Dependencies
+└── pyproject.toml        # 🔧 Project config
 ```
+
+---
+
+<div align="center">
+
+### 🔒 Built for accuracy over eloquence.
+**If it's not in the document, NOVA_HR won't tell you it is.**
+
+</div>
