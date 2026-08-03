@@ -21,6 +21,17 @@ from typing import Optional
 import firebase_admin
 from firebase_admin import credentials, firestore
 
+repo_root = Path(__file__).resolve().parent.parent
+env_path = repo_root / ".env"
+try:
+    from dotenv import load_dotenv
+    if env_path.exists():
+        load_dotenv(dotenv_path=env_path)
+    else:
+        load_dotenv()
+except ImportError:
+    pass
+
 # ── Constants ────────────────────────────────────────────────────────────────
 
 # Firebase Project ID
@@ -30,11 +41,22 @@ FIREBASE_PROJECT_ID: str = os.getenv("FIREBASE_PROJECT_ID", "lova-hr")
 COLLECTION_NAME: str = os.getenv("FIRESTORE_COLLECTION", "hr_policies")
 
 # BGE model identifiers (overridable via env)
-BGE_EMBEDDING_MODEL: str = os.getenv("BGE_EMBEDDING_MODEL", "BAAI/bge-m3")
+BGE_EMBEDDING_MODEL: str = os.getenv("BGE_EMBEDDING_MODEL", "BAAI/bge-large-en-v1.5")
 BGE_RERANKER_MODEL: str = os.getenv("BGE_RERANKER_MODEL", "BAAI/bge-reranker-v2-m3")
 
-# Embedding dimensionality for BAAI/bge-m3
+# LLM models are declared in src/generator.py (HF_MODELS registry):
+#   deepset/roberta-base-squad2 (extractive QA)
+#   Qwen/Qwen2.5-0.5B-Instruct   (causal LM)
+#   google/flan-t5-base          (seq2seq)
+# Optional cloud generation via the Hugging Face Router API (HF_TOKEN).
+
+# Embedding dimensionality for the default model BAAI/bge-large-en-v1.5
+# (BAAI/bge-m3 is a drop-in alternative — also 1024-dim).
 EMBEDDING_DIM: int = 1024
+
+# Chunking parameters (RecursiveCharacterTextSplitter)
+CHUNK_SIZE: int = 800
+CHUNK_OVERLAP: int = 100
 
 # Path to the local service-account key file (repo root)
 _DEFAULT_KEY_FILE = Path(__file__).resolve().parent.parent / "serviceAccountKey.json"

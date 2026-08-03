@@ -8,6 +8,11 @@ wheels/
 
 # Virtual environments
 .venv
+.venv*
+
+# Pytest & caches
+.pytest_cache/
+.uv-cache/
 
 # ChromaDB vector store (generated at runtime, kept for legacy reference)
 chroma_db/
@@ -21,6 +26,8 @@ serviceAccountKey.json
 
 # User data (uploaded documents — never commit private files)
 data/
+test_data/
+test_suite_data/
 
 # Lock files
 uv.lock

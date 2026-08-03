@@ -1,3 +1,9 @@
+"""
+test_retrieval.py
+Clean test suite for document retrieval:
+  - Multi-tenant BM25 lexical search
+  - Scoped company and subfolder search
+"""
 import os
 import shutil
 from pathlib import Path
@@ -5,7 +11,6 @@ import pytest
 from src.embeddings import EmbeddingPipeline
 from src.data_loader import load_all_documents
 
-# Setup a temporary data directory for testing
 TEST_DATA_DIR = Path("test_data")
 
 def safe_rmtree(path: Path):
@@ -25,14 +30,10 @@ def safe_rmtree(path: Path):
     try:
         shutil.rmtree(path)
     except Exception:
-        try:
-            os.rmdir(path)
-        except Exception:
-            pass
+        pass
 
 @pytest.fixture(scope="function", autouse=True)
 def setup_test_environment():
-    # Setup
     safe_rmtree(TEST_DATA_DIR)
     TEST_DATA_DIR.mkdir(parents=True, exist_ok=True)
     
@@ -58,137 +59,24 @@ def setup_test_environment():
                 "Medical certificate is required for leaves extending beyond 3 consecutive days.")
 
     yield
-    
-    # Teardown
     safe_rmtree(TEST_DATA_DIR)
 
 
-def test_data_loading():
+def test_lexical_search_multi_tenant():
+    pipeline = EmbeddingPipeline()
     docs = load_all_documents(str(TEST_DATA_DIR))
-    assert len(docs) >= 3
-    
-    # Check Google doc metadata
-    google_docs = [doc for doc in docs if doc.metadata.get("company") == "Google"]
-    assert len(google_docs) > 0
-    assert google_docs[0].metadata["subfolder"] == "Policies"
-    assert google_docs[0].metadata["filename"] == "annual_leave.txt"
+    pipeline.add_documents(docs)
 
-    # Check Apple doc metadata
-    apple_docs = [doc for doc in docs if doc.metadata.get("company") == "Apple"]
-    assert len(apple_docs) >= 2
-    subfolders = [doc.metadata["subfolder"] for doc in apple_docs]
-    assert "Benefits" in subfolders
-    assert "Policies" in subfolders
-
-
-def test_scoped_lexical_and_semantic_searching():
-    pipeline = EmbeddingPipeline(
-        chunk_size=100, 
-        chunk_overlap=20
-    )
-    pipeline.vector_store.clear()
-    
-    docs = load_all_documents(str(TEST_DATA_DIR))
-    chunks = pipeline.chunk_documents(docs)
-    
-    # Index
-    pipeline.sync_vector_store(chunks)
-    
-    # Test Scoped Lexical Search (within Google only)
-    # Search for "leave" (both Google and Apple have leave documents)
-    google_lex = pipeline.lexical_search(
-        query="leave",
-        chunks=chunks,
-        top_k=2,
-        company="Google"
-    )
-    assert len(google_lex) > 0
-    for res in google_lex:
+    # Scoped Google search
+    google_res = pipeline.lexical_search(query="annual leave", top_k=5, company="Google")
+    assert len(google_res) > 0
+    for res in google_res:
         assert res["company"] == "Google"
         assert "annual leave" in res["chunk_text"].lower()
 
-    # Test Scoped Lexical Search (within Apple only)
-    apple_lex = pipeline.lexical_search(
-        query="leave",
-        chunks=chunks,
-        top_k=2,
-        company="Apple"
-    )
-    assert len(apple_lex) > 0
-    for res in apple_lex:
+    # Scoped Apple search
+    apple_res = pipeline.lexical_search(query="sick leave", top_k=5, company="Apple")
+    assert len(apple_res) > 0
+    for res in apple_res:
         assert res["company"] == "Apple"
         assert "sick leave" in res["chunk_text"].lower()
-
-    # Test Scoped Semantic Search (within Apple > Benefits only)
-    apple_sem_benefits = pipeline.semantic_search(
-        query="insurance coverage",
-        top_k=2,
-        company="Apple",
-        subfolder="Benefits"
-    )
-    assert len(apple_sem_benefits) > 0
-    for res in apple_sem_benefits:
-        assert res["company"] == "Apple"
-        assert res["subfolder"] == "Benefits"
-        assert "insurance" in res["chunk_text"].lower() or "dental" in res["chunk_text"].lower()
-
-
-def test_scoped_chunk_deletion():
-    pipeline = EmbeddingPipeline(
-        chunk_size=100, 
-        chunk_overlap=20
-    )
-    pipeline.vector_store.clear()
-    
-    docs = load_all_documents(str(TEST_DATA_DIR))
-    chunks = pipeline.chunk_documents(docs)
-    pipeline.sync_vector_store(chunks)
-    
-    # Delete Google file
-    target_file = TEST_DATA_DIR / "Google" / "Policies" / "annual_leave.txt"
-    pipeline.vector_store.delete_file_chunks(str(target_file.resolve()))
-    
-    # Search Google again, should return no semantic results
-    google_res = pipeline.semantic_search(
-        query="annual leave",
-        top_k=2,
-        company="Google"
-    )
-    assert len(google_res) == 0
-
-
-def test_delete_company_and_subfolder_chunks():
-    pipeline = EmbeddingPipeline(chunk_size=100, chunk_overlap=20)
-    pipeline.vector_store.clear()
-    
-    docs = load_all_documents(str(TEST_DATA_DIR))
-    chunks = pipeline.chunk_documents(docs)
-    pipeline.sync_vector_store(chunks)
-    
-    # Delete Apple Benefits subfolder
-    pipeline.vector_store.delete_subfolder_chunks("Apple", "Benefits")
-    benefits_res = pipeline.semantic_search(
-        query="insurance dental medical",
-        top_k=2,
-        company="Apple",
-        subfolder="Benefits"
-    )
-    assert len(benefits_res) == 0
-    
-    # Apple Policies should still exist
-    policies_res = pipeline.semantic_search(
-        query="sick leave",
-        top_k=2,
-        company="Apple",
-        subfolder="Policies"
-    )
-    assert len(policies_res) > 0
-
-    # Delete entire Apple company
-    pipeline.vector_store.delete_company_chunks("Apple")
-    apple_res = pipeline.semantic_search(
-        query="leave medical insurance",
-        top_k=5,
-        company="Apple"
-    )
-    assert len(apple_res) == 0

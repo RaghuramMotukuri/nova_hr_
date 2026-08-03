@@ -1,8 +1,14 @@
 #!/usr/bin/env python3
+import os
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 """
 ingest_firebase.py
-CLI script to parse local policy files, chunk them, compute BGE-M3 embeddings,
-and upload them to Google Cloud Firestore.
+CLI script to parse local policy files, chunk them, compute BGE embeddings
+(BAAI/bge-large-en-v1.5), and upload them to Google Cloud Firestore.
 
 Usage:
     python ingest_firebase.py [OPTIONS]
@@ -138,14 +144,22 @@ def main() -> None:
     print("\n[Ingest] ✂️  Chunking documents...")
     t1 = time.time()
     from langchain_text_splitters import RecursiveCharacterTextSplitter
+    from src.preprocessor import sanitize_chunk, is_junk_chunk
+
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=args.chunk_size,
         chunk_overlap=args.chunk_overlap,
         length_function=len,
         separators=["\n\n", "\n", " ", ""],
     )
-    chunks = splitter.split_documents(documents)
-    print(f"[Ingest] {len(documents)} pages → {len(chunks)} chunks in {time.time() - t1:.1f}s.")
+    raw_chunks = splitter.split_documents(documents)
+    chunks = []
+    for c in raw_chunks:
+        clean = sanitize_chunk(c.page_content)
+        if clean and not is_junk_chunk(clean):
+            c.page_content = clean
+            chunks.append(c)
+    print(f"[Ingest] {len(documents)} pages → {len(chunks)} sanitized chunks in {time.time() - t1:.1f}s.")
 
     if args.dry_run:
         print("\n🏁 Dry run complete. No data was written to Firestore.")

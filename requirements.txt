@@ -14,7 +14,7 @@ docx2txt>=0.9
 firebase-admin>=6.5.0
 google-cloud-firestore>=2.19.0
 
-# ── Embeddings & Reranking (BGE-M3 / BGE-Reranker-V2-M3) ───────────────────
+# ── Embeddings & Reranking (BGE-Large / BGE-Reranker-V2-M3) ──────────────────
 torch>=2.0.0
 torchvision
 transformers>=4.44.0

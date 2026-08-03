@@ -1,7 +1,7 @@
 [project]
 name = "lova-hr"
 version = "2.0.0"
-description = "LOVA_HR — Firebase + BGE-M3 Hybrid RAG Engine (BM25 + Firestore + RRF + BGE Reranker)"
+description = "LOVA_HR — Firebase + BGE-Large Hybrid RAG Engine (BM25 + Firestore + RRF + BGE Reranker)"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [

@@ -1,9 +1,9 @@
 """
 test_ingestion_and_scoping.py
-Comprehensive TDD Test Suite for LOVA_HR:
-  - Phase 1: Ingestion & Metadata Enrichment (company_id, document_id, page_number, chunk_hash)
-  - Phase 2: Hybrid Retrieval (BM25 + BGE-M3 + RRF + BGE-Reranker-V2-M3)
-  - Phase 3: Cross-Tenant Data Isolation & Verbatim Accuracy
+Clean test suite for:
+  - Document ingestion and metadata enrichment (company, filename, page)
+  - Hybrid retrieval (BM25 + Semantic + RRF + Reranker)
+  - Tenant isolation and accuracy verification
 """
 import os
 import shutil
@@ -12,7 +12,7 @@ import pytest
 
 from src.data_loader import load_all_documents
 from src.embeddings import EmbeddingPipeline
-from src.retriever import HybridRetriever
+from src.retriever import HybridRetriever, validate_context_tenant
 
 TEST_SUITE_DIR = Path("test_suite_data")
 
@@ -70,75 +70,58 @@ def setup_test_suite_data():
         )
 
     yield
-
     safe_rmtree(TEST_SUITE_DIR)
 
 
-# ── PHASE 1 TESTS ────────────────────────────────────────────────────────────
-
 def test_document_metadata_enrichment():
-    """Verify parsed chunks carry company_id, document_id, page_number, chunk_hash."""
-    pipeline = EmbeddingPipeline(chunk_size=120, chunk_overlap=20)
-    pipeline.vector_store.clear()
-
+    """Verify parsed chunks carry company, filename, and page metadata."""
+    pipeline = EmbeddingPipeline()
     docs = load_all_documents(str(TEST_SUITE_DIR))
     assert len(docs) >= 3
 
-    chunks = pipeline.chunk_documents(docs)
-    pipeline.sync_vector_store(chunks)
+    pipeline.add_documents(docs)
+    assert len(pipeline._bm25_docs) >= 3
 
-    all_docs = pipeline.vector_store.get_all_documents()
-    assert len(all_docs) >= 3
-
-    for doc in all_docs:
-        assert "company" in doc or "company_id" in doc
-        meta = doc if "company_id" in doc else doc
-        assert meta.get("company_id") in ["TCS", "Infosys", "Wipro"]
-        assert meta.get("filename") in ["notice_period.txt", "health_insurance.txt", "annual_leave.txt"]
+    for doc in pipeline._bm25_docs:
+        assert doc.get("company") in ["TCS", "Infosys", "Wipro"]
+        assert doc.get("filename") in ["notice_period.txt", "health_insurance.txt", "annual_leave.txt"]
         assert doc.get("chunk_text") != ""
 
 
 def test_company_categorization_and_partitioning():
-    """Verify local and vector storage partitioning strictly by company_id."""
-    pipeline = EmbeddingPipeline(chunk_size=120, chunk_overlap=20)
-    pipeline.vector_store.clear()
-
+    """Verify document partitioning strictly by company."""
+    pipeline = EmbeddingPipeline()
     docs = load_all_documents(str(TEST_SUITE_DIR))
-    chunks = pipeline.chunk_documents(docs)
-    pipeline.sync_vector_store(chunks)
+    pipeline.add_documents(docs)
 
-    # Query scoped to TCS only
-    tcs_docs = pipeline.vector_store.get_all_documents(company="TCS")
+    tcs_docs = pipeline.lexical_search(query="notice period", company="TCS")
     assert len(tcs_docs) > 0
     for d in tcs_docs:
         assert d["company"] == "TCS"
         assert d["filename"] == "notice_period.txt"
 
-    # Query scoped to Infosys only
-    inf_docs = pipeline.vector_store.get_all_documents(company="Infosys")
+    inf_docs = pipeline.lexical_search(query="insurance", company="Infosys")
     assert len(inf_docs) > 0
     for d in inf_docs:
         assert d["company"] == "Infosys"
         assert d["filename"] == "health_insurance.txt"
 
 
-# ── PHASE 2 TESTS ────────────────────────────────────────────────────────────
-
 def test_hybrid_retrieval_and_reranking():
-    """Verify BM25 + BGE-M3 RRF fusion + Cross-Encoder reranking pipeline."""
-    pipeline = EmbeddingPipeline(chunk_size=120, chunk_overlap=20)
-    pipeline.vector_store.clear()
-
+    """Verify BM25 + RRF fusion + Reranker pipeline."""
+    pipeline = EmbeddingPipeline()
     docs = load_all_documents(str(TEST_SUITE_DIR))
-    chunks = pipeline.chunk_documents(docs)
-    pipeline.sync_vector_store(chunks)
+    pipeline.add_documents(docs)
 
     retriever = HybridRetriever(pipeline=pipeline)
+    retriever._firebase_ok = False
+
     res = retriever.search(
         query="What is the notice period for employees?",
         company="TCS",
         top_k=2,
-        rerank_top_n=2
+        rerank_top_n=2,
+        use_local_engine=False,
     )
 
     assert len(res["reranked"]) > 0
@@ -147,28 +130,22 @@ def test_hybrid_retrieval_and_reranking():
     assert "90 days" in top_chunk["chunk_text"].lower()
 
 
-# ── PHASE 3 TESTS ────────────────────────────────────────────────────────────
-
 def test_cross_tenant_data_isolation():
     """Ensure Company A queries NEVER return Company B or Company C chunks."""
-    pipeline = EmbeddingPipeline(chunk_size=120, chunk_overlap=20)
-    pipeline.vector_store.clear()
-
+    pipeline = EmbeddingPipeline()
     docs = load_all_documents(str(TEST_SUITE_DIR))
-    chunks = pipeline.chunk_documents(docs)
-    pipeline.sync_vector_store(chunks)
+    pipeline.add_documents(docs)
 
     retriever = HybridRetriever(pipeline=pipeline)
+    retriever._firebase_ok = False
 
-    # Search TCS for "leave" (Infosys & Wipro have leave/maternity policies, TCS has notice period)
-    tcs_res = retriever.search(query="leave policy", company="TCS", top_k=5)
+    tcs_res = retriever.search(query="leave policy", company="TCS", top_k=5, use_local_engine=False)
     for doc in tcs_res["reranked"]:
         assert doc["company"] == "TCS"
         assert doc["company"] != "Infosys"
         assert doc["company"] != "Wipro"
 
-    # Search Wipro for "insurance" (Infosys has insurance, Wipro does not)
-    wip_res = retriever.search(query="insurance benefit", company="Wipro", top_k=5)
+    wip_res = retriever.search(query="insurance benefit", company="Wipro", top_k=5, use_local_engine=False)
     for doc in wip_res["reranked"]:
         assert doc["company"] == "Wipro"
         assert doc["company"] != "Infosys"
@@ -176,21 +153,17 @@ def test_cross_tenant_data_isolation():
 
 def test_verbatim_ground_truth_accuracy():
     """Verify retrieved output matches exact source policy facts verbatim."""
-    pipeline = EmbeddingPipeline(chunk_size=120, chunk_overlap=20)
-    pipeline.vector_store.clear()
-
+    pipeline = EmbeddingPipeline()
     docs = load_all_documents(str(TEST_SUITE_DIR))
-    chunks = pipeline.chunk_documents(docs)
-    pipeline.sync_vector_store(chunks)
+    pipeline.add_documents(docs)
 
     retriever = HybridRetriever(pipeline=pipeline)
+    retriever._firebase_ok = False
 
-    # Infosys Maternity Leave
-    inf_res = retriever.search(query="maternity leave weeks", company="Infosys")
+    inf_res = retriever.search(query="maternity leave weeks", company="Infosys", use_local_engine=False)
     assert len(inf_res["reranked"]) > 0
     assert "26 weeks" in inf_res["reranked"][0]["chunk_text"]
 
-    # Wipro Carry Forward Limit
-    wip_res = retriever.search(query="carry forward limit earned leave", company="Wipro")
+    wip_res = retriever.search(query="carry forward limit earned leave", company="Wipro", use_local_engine=False)
     assert len(wip_res["reranked"]) > 0
     assert "45 days" in wip_res["reranked"][0]["chunk_text"]

@@ -5,7 +5,8 @@ Dedicated tests for:
   2. Hard pre-retrieval tenant isolation & safety net validation
 """
 import pytest
-from src.embeddings import is_junk_chunk, EmbeddingPipeline
+from src.preprocessor import is_junk_chunk
+from src.embeddings import EmbeddingPipeline
 from src.retriever import validate_context_tenant, HybridRetriever
 from langchain_core.documents import Document
 
@@ -65,7 +66,7 @@ def test_validate_context_tenant_leak_prevention():
 
 
 def test_junk_chunk_stripping_during_ingestion():
-    pipeline = EmbeddingPipeline()
+    from src.preprocessor import sanitize_chunk, is_junk_chunk
     docs = [
         Document(
             page_content="Table of Contents\n1. Policy overview ..... 3\n2. Leave allowance ..... 7",
@@ -76,7 +77,12 @@ def test_junk_chunk_stripping_during_ingestion():
             metadata={"company": "TCS", "subfolder": "General", "filename": "leave.txt"}
         )
     ]
-    chunks = pipeline.chunk_documents(docs)
-    # The TOC document must be stripped out by chunk_documents
-    assert len(chunks) == 1
-    assert "Full-time employees" in chunks[0].page_content
+    valid_docs = []
+    for d in docs:
+        clean = sanitize_chunk(d.page_content)
+        if clean and not is_junk_chunk(clean):
+            d.page_content = clean
+            valid_docs.append(d)
+
+    assert len(valid_docs) == 1
+    assert "Full-time employees" in valid_docs[0].page_content

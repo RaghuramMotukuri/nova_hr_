@@ -1,1160 +1,1032 @@
 """
-app.py – LOVA_HR | Firebase-Powered Hybrid RAG Engine
-BM25 Lexical + Firestore Semantic (BGE-M3) + RRF Fusion + BGE Reranker + Phi-3.5-mini-instruct.
-Organized by company and subfolders. Full RAG pipeline with Hugging Face generation.
+app.py
+LOVA HR — Production-Ready Streamlit Web Application
+Clean rebuild with premium dark-mode UI and full pipeline integration.
+
+Features:
+  - 3 User-Selected Hugging Face Models (RoBERTa Extractive QA, Qwen 0.5B CausalLM, Flan-T5 Seq2Seq)
+  - Top-Right "ℹ️ Pipeline Steps" Popover Info Button
+  - Full-Width Clean Question & Answer UI
 """
-import streamlit as st
-import os
-
-# ── Environment & Performance Optimization Flags ───────────────────────────
-os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "1"
-os.environ["TOKENIZERS_PARALLELISM"] = "false"
-
-import shutil
-import stat
-import hashlib
-import html
+import sys
 import re
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import Dict, List
+import streamlit as st
 
+# ── Path setup ────────────────────────────────────────────────────────────────
+ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(ROOT))
 
-def _safe_rmtree(path: Path, retries: int = 3, delay: float = 0.5) -> None:
-    """Remove a directory tree safely on Windows.
+try:
+    from dotenv import load_dotenv
+    load_dotenv(dotenv_path=ROOT / ".env", override=True)
+except ImportError:
+    pass
 
-    Handles two common Windows failure modes:
-    1. Read-only files (OneDrive sync, Windows marking uploads as RO):
-       The onerror callback clears the read-only bit and retries.
-    2. Transient file locks (Streamlit reruns, ChromaDB flushing):
-       Retries up to `retries` times with `delay` seconds between attempts.
-    """
-    import time
-
-    def _handle_readonly(func, fpath, exc_info):
-        try:
-            os.chmod(fpath, stat.S_IWRITE)
-            func(fpath)
-        except Exception as e:
-            print(f"[App] Could not remove '{fpath}': {e}")
-
-    for attempt in range(1, retries + 1):
-        try:
-            shutil.rmtree(str(path), onerror=_handle_readonly)
-            return  # success
-        except PermissionError as e:
-            if attempt < retries:
-                print(f"[App] rmtree attempt {attempt} failed ({e}) — retrying in {delay}s…")
-                time.sleep(delay)
-            else:
-                print(f"[App] _safe_rmtree permanently failed for '{path}': {e}")
-        except Exception as e:
-            print(f"[App] _safe_rmtree unexpected error for '{path}': {e}")
-            return
-
-from src.embeddings import EmbeddingPipeline
-from src.retriever import HybridRetriever
-from src.config import is_firebase_available
-from src.data_loader import load_all_documents
-
-# ── Page config ───────────────────────────────────────────────────────────────
+# ── Streamlit page config (MUST be first st call) ─────────────────────────────
 st.set_page_config(
-    page_title="LOVA_HR — Scoped RAG",
-    page_icon="⚡",
+    page_title="LOVA HR — AI Policy Assistant",
+    page_icon="🧠",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-# ── Global CSS ────────────────────────────────────────────────────────────────
-st.markdown(
-    """
-    <style>
-    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap');
+# ── Premium Dark-Mode CSS ─────────────────────────────────────────────────────
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap');
 
-    html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
-
-    /* Hide default Streamlit chrome */
-    #MainMenu, footer { visibility: hidden; }
-    header[data-testid="stHeader"] { background: transparent; }
-
-    /* Custom Hero and Titles */
-    .hero-container {
-        text-align: center;
-        padding: 1.2rem 0 0.8rem 0;
-        margin-bottom: 1.5rem;
-        border-bottom: 1px solid rgba(255, 255, 255, 0.05);
-    }
-    .hero-title {
-        font-size: 2.8rem;
-        font-weight: 800;
-        letter-spacing: -0.02em;
-        background: linear-gradient(135deg, #a5b4fc 0%, #6366f1 50%, #4f46e5 100%);
-        -webkit-background-clip: text;
-        -webkit-text-fill-color: transparent;
-        margin: 0;
-    }
-    .hero-subtitle {
-        font-size: 0.9rem;
-        color: #94a3b8;
-        margin-top: 0.4rem;
-        letter-spacing: 0.05em;
-        text-transform: uppercase;
-    }
-
-    /* Scope indicator banner */
-    .scope-banner {
-        background: rgba(99, 102, 241, 0.05);
-        border: 1px solid rgba(99, 102, 241, 0.15);
-        border-radius: 8px;
-        padding: 0.6rem 1rem;
-        margin-bottom: 1.5rem;
-        font-size: 0.88rem;
-        color: #e2e8f0;
-        display: flex;
-        align-items: center;
-        gap: 0.5rem;
-    }
-    .scope-label {
-        font-weight: 700;
-        color: #a5b4fc;
-        text-transform: uppercase;
-        font-size: 0.75rem;
-        letter-spacing: 0.05em;
-    }
-
-    /* Result cards */
-    .result-card {
-        background: rgba(15, 23, 42, 0.6);
-        border-left: 4px solid #6366f1;
-        border-right: 1px solid rgba(255, 255, 255, 0.05);
-        border-top: 1px solid rgba(255, 255, 255, 0.05);
-        border-bottom: 1px solid rgba(255, 255, 255, 0.05);
-        border-radius: 6px;
-        padding: 1.2rem;
-        margin-bottom: 1rem;
-        box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
-    }
-    .lexical-card {
-        border-left-color: #ec4899; /* Pink accent */
-    }
-    .semantic-card {
-        border-left-color: #6366f1; /* Indigo accent */
-    }
-    .reranked-card {
-        border-left-color: #f59e0b; /* Amber accent — top quality results */
-        background: rgba(245, 158, 11, 0.04);
-    }
-    .card-header {
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-        margin-bottom: 0.8rem;
-        font-size: 0.8rem;
-    }
-    .doc-badge {
-        background: rgba(255, 255, 255, 0.05);
-        border: 1px solid rgba(255, 255, 255, 0.1);
-        color: #cbd5e1;
-        padding: 0.2rem 0.5rem;
-        border-radius: 4px;
-        font-weight: 500;
-        font-size: 0.75rem;
-    }
-    .score-badge {
-        font-weight: 600;
-        padding: 0.2rem 0.5rem;
-        border-radius: 4px;
-    }
-    .lexical-score {
-        color: #fbcfe8;
-        background: rgba(236, 72, 153, 0.15);
-    }
-    .semantic-score {
-        color: #e0e7ff;
-        background: rgba(99, 102, 241, 0.15);
-    }
-    .reranked-score {
-        color: #fef3c7;
-        background: rgba(245, 158, 11, 0.20);
-    }
-    .card-body {
-        color: #e2e8f0;
-        font-size: 0.88rem;
-        line-height: 1.6;
-        white-space: pre-wrap;
-    }
-    /* Firebase status badge */
-    .firebase-badge {
-        display: inline-flex;
-        align-items: center;
-        gap: 0.3rem;
-        font-size: 0.75rem;
-        font-weight: 600;
-        padding: 0.25rem 0.6rem;
-        border-radius: 20px;
-        letter-spacing: 0.03em;
-    }
-    .firebase-online {
-        background: rgba(34, 197, 94, 0.15);
-        border: 1px solid rgba(34, 197, 94, 0.3);
-        color: #86efac;
-    }
-    .firebase-offline {
-        background: rgba(239, 68, 68, 0.15);
-        border: 1px solid rgba(239, 68, 68, 0.3);
-        color: #fca5a5;
-    }
-
-    /* Sidebar Styling */
-    .sidebar-title {
-        font-size: 1.1rem;
-        font-weight: 700;
-        color: #f8fafc;
-        margin-top: 0.5rem;
-        margin-bottom: 0.8rem;
-    }
-    .library-section {
-        background: rgba(255, 255, 255, 0.02);
-        border: 1px solid rgba(255, 255, 255, 0.05);
-        border-radius: 6px;
-        padding: 0.6rem;
-        margin-bottom: 0.8rem;
-    }
-    .company-title {
-        font-size: 0.85rem;
-        font-weight: 700;
-        color: #f1f5f9;
-        margin-bottom: 0.3rem;
-        text-transform: uppercase;
-        border-bottom: 1px solid rgba(255, 255, 255, 0.08);
-        padding-bottom: 0.2rem;
-    }
-    .subfolder-title {
-        font-size: 0.8rem;
-        font-weight: 600;
-        color: #94a3b8;
-        margin-left: 0.4rem;
-        margin-top: 0.3rem;
-        margin-bottom: 0.2rem;
-    }
-    .file-item {
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-        padding: 0.3rem 0.5rem;
-        background: rgba(255, 255, 255, 0.01);
-        border-radius: 4px;
-        margin-left: 0.8rem;
-        margin-bottom: 0.25rem;
-        border: 1px solid rgba(255, 255, 255, 0.03);
-    }
-    .file-info {
-        font-size: 0.78rem;
-        color: #cbd5e1;
-        overflow: hidden;
-        text-overflow: ellipsis;
-        white-space: nowrap;
-        max-width: 80%;
-    }
-    .file-size {
-        font-size: 0.68rem;
-        color: #64748b;
-        margin-left: 0.4rem;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
-# ── Helper to render single-tab output and references ───────────────────────
-# Provider style registry (mirrors generator.py _PROVIDERS)
-_PROVIDER_STYLES: Dict[str, Dict[str, str]] = {
-    "phi35": {
-        "label":      "Phi-3.5-mini-instruct",
-        "icon":       "🧠",
-        "color":      "#38bdf8",
-        "bg":         "rgba(56,189,248,0.06)",
-        "border":     "#38bdf8",
-        "glow":       "rgba(56,189,248,0.18)",
-        "badge_bg":   "rgba(56,189,248,0.15)",
-    },
-    "groq": {
-        "label":      "llama-3.1-8b-instant",
-        "icon":       "⚡",
-        "color":      "#a78bfa",
-        "bg":         "rgba(167,139,250,0.06)",
-        "border":     "#a78bfa",
-        "glow":       "rgba(167,139,250,0.18)",
-        "badge_bg":   "rgba(167,139,250,0.15)",
-    },
-    "extractive": {
-        "label":      "Extractive Grounded Baseline",
-        "icon":       "📋",
-        "color":      "#34d399",
-        "bg":         "rgba(52,211,153,0.06)",
-        "border":     "#34d399",
-        "glow":       "rgba(52,211,153,0.14)",
-        "badge_bg":   "rgba(52,211,153,0.12)",
-    },
+:root {
+    --bg-primary:    #0a0f1e;
+    --bg-surface:    #0f1629;
+    --bg-elevated:   #151f3a;
+    --bg-card:       #1a2545;
+    --accent-blue:   #4f7cf7;
+    --accent-indigo: #6366f1;
+    --accent-cyan:   #06b6d4;
+    --accent-emerald:#10b981;
+    --accent-rose:   #f43f5e;
+    --accent-amber:  #f59e0b;
+    --text-primary:  #f1f5f9;
+    --text-secondary:#94a3b8;
+    --text-muted:    #64748b;
+    --border:        rgba(99,102,241,0.2);
+    --border-hover:  rgba(79,124,247,0.5);
+    --glow:          0 0 30px rgba(79,124,247,0.15);
+    --radius:        12px;
+    --radius-sm:     8px;
 }
 
-_PROVIDER_BADGE: Dict[str, str] = {
-    "phi35":      "HF Serverless",
-    "groq":       "Llama 3.1",
-    "extractive": "Extractive",
+html, body, [class*="css"] {
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+    background-color: var(--bg-primary) !important;
+    color: var(--text-primary) !important;
 }
 
+.app-header-container {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    background: linear-gradient(135deg, #0f1629 0%, #1a2545 50%, #0f1629 100%);
+    border-bottom: 1px solid var(--border);
+    padding: 1.2rem 2rem;
+    margin: -1rem -1rem 1.5rem -1rem;
+    position: relative; overflow: hidden;
+}
+.app-header-container::before {
+    content: "";
+    position: absolute; top: 0; left: 0; right: 0; bottom: 0;
+    background: radial-gradient(ellipse at 30% 50%, rgba(79,124,247,0.08) 0%, transparent 70%);
+}
+.app-header-left {
+    display: flex; align-items: center; gap: 1rem;
+}
+.app-header-icon {
+    width: 48px; height: 48px;
+    background: linear-gradient(135deg, #4f7cf7, #6366f1);
+    border-radius: 12px;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 24px; box-shadow: 0 0 20px rgba(79,124,247,0.4);
+    flex-shrink: 0;
+}
+.app-header-title { font-size: 1.5rem; font-weight: 800; letter-spacing: -0.02em; }
+.app-header-sub   { font-size: 0.78rem; color: var(--text-secondary); margin-top: 2px; }
 
-def _render_answer_card(
-    answer_text: str,
-    provider_key: str,
-    card_index: int,
-) -> None:
-    """Render a single provider answer card with its accent color scheme."""
-    style = _PROVIDER_STYLES.get(provider_key, _PROVIDER_STYLES["extractive"])
-    badge = _PROVIDER_BADGE.get(provider_key, "Free Tier")
-    safe_text = html.escape(answer_text).replace("\n", "<br>")
-    st.markdown(
-        f'<div style="'
-        f'background: linear-gradient(135deg, rgba(15,23,42,0.97), {style["bg"]}); '
-        f'border: 1px solid {style["border"]}; border-radius: 12px; '
-        f'padding: 1.2rem 1.3rem; margin-bottom: 1rem; '
-        f'box-shadow: 0 4px 22px {style["glow"]};">'
-        f'<div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.9rem;">'
-        f'<span style="font-weight:700; color:{style["color"]}; font-size:1rem;">'
-        f'{style["icon"]} Output #{card_index} \u2014 {style["label"]}'
-        f'</span>'
-        f'<span style="background:{style["badge_bg"]}; color:{style["color"]}; '
-        f'padding:0.2rem 0.65rem; border-radius:20px; font-size:0.72rem; '
-        f'font-weight:600; letter-spacing:0.03em;">{badge}</span>'
-        f'</div>'
-        f'<div style="color:#e2e8f0; font-size:0.93rem; line-height:1.7;">'
-        f'{safe_text}'
-        f'</div>'
-        f'</div>',
-        unsafe_allow_html=True,
+[data-testid="stSidebar"] {
+    background: var(--bg-surface) !important;
+    border-right: 1px solid var(--border) !important;
+}
+[data-testid="stSidebar"] * { color: var(--text-primary) !important; }
+
+.sidebar-section {
+    background: var(--bg-elevated);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 1rem; margin-bottom: 0.75rem;
+}
+.sidebar-section-title {
+    font-size: 0.68rem; font-weight: 700; letter-spacing: 0.1em;
+    text-transform: uppercase; color: #6366f1 !important;
+    margin-bottom: 0.6rem; padding-bottom: 0.4rem;
+    border-bottom: 1px solid var(--border);
+}
+
+.status-badge {
+    display: inline-flex; align-items: center; gap: 0.35rem;
+    padding: 0.25rem 0.7rem; border-radius: 20px;
+    font-size: 0.72rem; font-weight: 600;
+}
+.status-online  { background: rgba(16,185,129,0.15); color: #10b981; border: 1px solid rgba(16,185,129,0.3); }
+.status-offline { background: rgba(244,63,94,0.15);  color: #f43f5e; border: 1px solid rgba(244,63,94,0.3); }
+.status-warning { background: rgba(245,158,11,0.15); color: #f59e0b; border: 1px solid rgba(245,158,11,0.3); }
+
+.stTextArea textarea, .stTextInput input {
+    background: var(--bg-elevated) !important;
+    border: 1px solid var(--border) !important;
+    border-radius: var(--radius-sm) !important;
+    color: var(--text-primary) !important;
+}
+.stTextArea textarea:focus, .stTextInput input:focus {
+    border-color: var(--accent-blue) !important;
+    box-shadow: 0 0 0 3px rgba(79,124,247,0.15) !important;
+}
+
+.answer-card {
+    background: linear-gradient(135deg, var(--bg-card) 0%, var(--bg-elevated) 100%);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 1.5rem; margin: 1rem 0;
+    box-shadow: var(--glow);
+    position: relative; overflow: hidden;
+}
+.answer-card::before {
+    content: "";
+    position: absolute; top: 0; left: 0;
+    width: 3px; height: 100%;
+    background: linear-gradient(180deg, #4f7cf7, #6366f1);
+}
+.answer-card-header {
+    display: flex; align-items: center; gap: 0.6rem;
+    margin-bottom: 1rem; padding-bottom: 0.75rem;
+    border-bottom: 1px solid var(--border);
+}
+.provider-badge {
+    padding: 0.25rem 0.8rem; border-radius: 20px;
+    font-size: 0.75rem; font-weight: 700; letter-spacing: 0.03em;
+}
+.answer-text { line-height: 1.8; color: var(--text-primary); font-size: 0.95rem; }
+
+.citation-card {
+    background: var(--bg-elevated);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    padding: 0.85rem 1rem; margin-bottom: 0.5rem;
+}
+
+.metric-card {
+    background: var(--bg-elevated);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 1rem 1.25rem; text-align: center;
+}
+.metric-value {
+    font-size: 1.8rem; font-weight: 800;
+    background: linear-gradient(135deg, #4f7cf7, #6366f1);
+    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+}
+.metric-label { font-size: 0.72rem; color: var(--text-secondary); margin-top: 2px; }
+
+/* Multi-Company Comparison Cards */
+.multi-company-general {
+    background: linear-gradient(135deg, rgba(16,185,129,0.08) 0%, rgba(16,185,129,0.04) 100%);
+    border: 1px solid rgba(16,185,129,0.3);
+    border-left: 4px solid #10b981;
+    border-radius: var(--radius);
+    padding: 1.25rem 1.5rem;
+    margin: 0.75rem 0;
+}
+.multi-company-general .answer-card-header {
+    border-bottom-color: rgba(16,185,129,0.2);
+}
+.multi-company-diff {
+    background: linear-gradient(135deg, rgba(99,102,241,0.08) 0%, rgba(99,102,241,0.04) 100%);
+    border: 1px solid rgba(99,102,241,0.3);
+    border-left: 4px solid #6366f1;
+    border-radius: var(--radius);
+    padding: 1.25rem 1.5rem;
+    margin: 0.75rem 0;
+}
+.multi-company-diff .answer-card-header {
+    border-bottom-color: rgba(99,102,241,0.2);
+}
+.multi-company-summary {
+    background: linear-gradient(135deg, rgba(245,158,11,0.08) 0%, rgba(245,158,11,0.04) 100%);
+    border: 1px solid rgba(245,158,11,0.3);
+    border-left: 4px solid #f59e0b;
+    border-radius: var(--radius);
+    padding: 1.25rem 1.5rem;
+    margin: 0.75rem 0;
+}
+.multi-company-summary .answer-card-header {
+    border-bottom-color: rgba(245,158,11,0.2);
+}
+.company-tag {
+    display: inline-block;
+    background: rgba(79,124,247,0.12);
+    color: var(--accent-blue);
+    border: 1px solid rgba(79,124,247,0.3);
+    border-radius: 6px;
+    padding: 0.2rem 0.6rem;
+    font-size: 0.7rem;
+    font-weight: 600;
+    margin: 0.2rem;
+}
+.multi-company-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.3rem;
+    background: rgba(16,185,129,0.12);
+    color: #10b981;
+    border: 1px solid rgba(16,185,129,0.3);
+    border-radius: 20px;
+    padding: 0.3rem 0.8rem;
+    font-size: 0.72rem;
+    font-weight: 600;
+}
+
+/* Sticky Top Header Panel */
+.sticky-top-panel {
+    position: sticky;
+    top: 0;
+    z-index: 9999;
+    background: linear-gradient(135deg, #0a0f1e 0%, #0f1629 50%, #0a0f1e 100%);
+    border-bottom: 1px solid var(--border);
+    padding: 0.75rem 1.5rem;
+    margin: -1rem -1rem 0.5rem -1rem;
+    box-shadow: 0 8px 32px rgba(0,0,0,0.5);
+    backdrop-filter: blur(12px);
+}
+.sticky-top-panel .app-header-left {
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+}
+.sticky-top-panel .app-header-icon {
+    width: 40px;
+    height: 40px;
+    background: linear-gradient(135deg, #4f7cf7, #6366f1);
+    border-radius: 10px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 20px;
+    box-shadow: 0 0 15px rgba(79,124,247,0.4);
+    flex-shrink: 0;
+}
+.sticky-top-panel .app-header-title {
+    font-size: 1.2rem;
+    font-weight: 800;
+    letter-spacing: -0.02em;
+    margin: 0;
+}
+.sticky-top-panel .app-header-sub {
+    font-size: 0.65rem;
+    color: var(--text-secondary);
+    margin-top: 1px;
+}
+.sticky-top-panel [data-testid="stHorizontalBlock"] {
+    background: transparent !important;
+}
+.sticky-top-panel [data-testid="stHorizontalBlock"] > div {
+    background: transparent !important;
+}
+/* Tab strip inside sticky panel */
+.sticky-tabs {
+    position: sticky;
+    top: 85px;
+    z-index: 9998;
+    background: rgba(10,15,30,0.95);
+    border-bottom: 1px solid var(--border);
+    padding: 0.25rem 0.5rem;
+    margin: 0 -1rem;
+    backdrop-filter: blur(8px);
+}
+.sticky-tabs [data-testid="stTabs"] {
+    border: none !important;
+    background: transparent !important;
+}
+.sticky-tabs [data-testid="stTabs"] > div[role="tablist"] {
+    background: transparent !important;
+    border-bottom: none !important;
+}
+
+.stButton > button {
+    background: linear-gradient(135deg, #4f7cf7, #6366f1) !important;
+    color: #fff !important; border: none !important;
+    border-radius: var(--radius-sm) !important;
+    font-weight: 600 !important;
+    padding: 0.5rem 1.5rem !important;
+    box-shadow: 0 4px 15px rgba(79,124,247,0.3) !important;
+    transition: all 0.2s !important;
+}
+.stButton > button:hover {
+    transform: translateY(-1px) !important;
+    box-shadow: 0 8px 25px rgba(79,124,247,0.4) !important;
+}
+
+[data-testid="stTabs"] button[aria-selected="true"] {
+    background: linear-gradient(135deg, rgba(79,124,247,0.2), rgba(99,102,241,0.2)) !important;
+    border-bottom: 2px solid #4f7cf7 !important;
+    color: #4f7cf7 !important;
+}
+
+hr { border-color: var(--border) !important; }
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: var(--bg-surface); }
+::-webkit-scrollbar-thumb { background: rgba(79,124,247,0.5); border-radius: 3px; }
+</style>
+""", unsafe_allow_html=True)
+
+
+# ── Sticky Top Panel (Header + Tabs) ─────────────────────────────────────────
+st.markdown('<div class="sticky-top-panel">', unsafe_allow_html=True)
+
+col_head_left, col_head_right = st.columns([4, 1], vertical_alignment="center")
+
+with col_head_left:
+    st.markdown("""
+    <div class="app-header-left">
+        <div class="app-header-icon">🧠</div>
+        <div>
+            <div class="app-header-title">LOVA HR — AI Policy Assistant</div>
+            <div class="app-header-sub">
+                BGE-Large Embeddings &bull; BGE Reranker V2 M3 &bull; RoBERTa / Qwen 0.5B / Flan-T5 &bull; Firebase Vector Search
+            </div>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+with col_head_right:
+    with st.popover("ℹ️ About Pipeline", use_container_width=True):
+        st.markdown("### 💡 Pipeline Steps")
+        steps = [
+            ("1", "Sanitize",    "Strip index markers from query and context", "#4f7cf7"),
+            ("2", "Boundary",    "Topic boundary check — refuse out-of-scope", "#f43f5e"),
+            ("3", "BM25",        "Keyword search over indexed policy chunks",   "#06b6d4"),
+            ("4", "Semantic",    "Firestore vector search (BGE-Large embeddings)", "#6366f1"),
+            ("5", "RRF Fusion",  "Reciprocal Rank Fusion merges both signals",  "#10b981"),
+            ("6", "Reranker",    "BGE Reranker V2 M3 cross-encoder scoring",   "#f59e0b"),
+            ("7", "LLM Answer",  "Selected HF model grounded answer generation", "#ec4899"),
+        ]
+        for num, title, desc, color in steps:
+            st.markdown(f"""
+<div style="display:flex;gap:0.75rem;margin-bottom:0.5rem;padding:0.6rem;
+            background:#1a2545;border-radius:8px;border-left:3px solid {color};">
+    <div style="background:{color}22;color:{color};min-width:20px;height:20px;
+                border-radius:5px;display:flex;align-items:center;justify-content:center;
+                font-size:0.7rem;font-weight:700;">{num}</div>
+    <div>
+        <div style="font-weight:600;font-size:0.82rem;color:#f1f5f9;">{title}</div>
+        <div style="font-size:0.72rem;color:#64748b;">{desc}</div>
+    </div>
+</div>""", unsafe_allow_html=True)
+
+st.markdown('</div>', unsafe_allow_html=True)
+
+
+# ── Session state ─────────────────────────────────────────────────────────────
+defaults = {
+    "retriever": None, "pipeline": None,
+    "chat_history": [], "docs_indexed": 0, "last_result": None,
+    "confirm_del_company": None,
+}
+for k, v in defaults.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
+
+
+# ── Cached resources ──────────────────────────────────────────────────────────
+@st.cache_resource(show_spinner="Initializing AI pipeline...")
+def get_retriever():
+    from src.retriever import HybridRetriever
+    from src.embeddings import EmbeddingPipeline
+    pipeline = EmbeddingPipeline()
+    retriever = HybridRetriever(pipeline=pipeline)
+    try:
+        from src.data_loader import load_all_documents
+        docs = load_all_documents("data")
+        if docs:
+            pipeline.add_documents(docs)
+            print(f"[App] Pre-loaded {len(docs)} document chunks from data/")
+    except Exception as exc:
+        print(f"[App] Data pre-load warning: {exc}")
+    return retriever
+
+
+@st.cache_data(show_spinner=False, ttl=300)
+def check_firebase():
+    from src.config import is_firebase_available
+    return is_firebase_available()
+
+
+def _hex_to_rgb(hex_color: str) -> str:
+    h = hex_color.lstrip("#")
+    if len(h) == 6:
+        r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+        return f"{r},{g},{b}"
+    return "79,124,247"
+
+
+# ── Sidebar ───────────────────────────────────────────────────────────────────
+with st.sidebar:
+    st.markdown("## ⚙️ Configuration")
+
+    # New Chat at top
+    st.markdown('<div class="sidebar-section">', unsafe_allow_html=True)
+    st.markdown('<div class="sidebar-section-title">🆕 New Chat</div>', unsafe_allow_html=True)
+    if st.button("➕ Start New Conversation", key="new_chat_btn", use_container_width=True):
+        st.session_state.chat_history = []
+        st.session_state.last_result = None
+        st.success("Started a new conversation.")
+        st.rerun()
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    # Firebase status
+    st.markdown('<div class="sidebar-section">', unsafe_allow_html=True)
+    st.markdown('<div class="sidebar-section-title">🔥 Firebase Status</div>', unsafe_allow_html=True)
+    fb_ok = check_firebase()
+    badge_class = "status-online" if fb_ok else "status-offline"
+    badge_text  = "● Online — Semantic Search Active" if fb_ok else "● Offline — BM25 Only Mode"
+    st.markdown(f'<span class="status-badge {badge_class}">{badge_text}</span>', unsafe_allow_html=True)
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    # Tenant
+    st.markdown('<div class="sidebar-section">', unsafe_allow_html=True)
+    st.markdown('<div class="sidebar-section-title">🏢 Tenant Scope</div>', unsafe_allow_html=True)
+    company_options = ["All Companies"]
+    data_path = ROOT / "data"
+    if data_path.exists():
+        subdirs = sorted([d.name for d in data_path.iterdir() if d.is_dir()])
+        company_options.extend(subdirs)
+    selected_company = st.selectbox(
+        "Company", company_options, key="company_select", label_visibility="collapsed"
+    )
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    # Model & RAG (ONLY the 3 requested HuggingFace models)
+    st.markdown('<div class="sidebar-section">', unsafe_allow_html=True)
+    st.markdown('<div class="sidebar-section-title">🤖 AI Model Settings</div>', unsafe_allow_html=True)
+    from src.generator import HF_MODELS, DEFAULT_HF_MODEL
+
+    model_keys   = list(HF_MODELS.keys())
+    model_labels = [f"{HF_MODELS[m]['icon']} {HF_MODELS[m]['label']}" for m in model_keys]
+    default_idx  = model_keys.index(DEFAULT_HF_MODEL) if DEFAULT_HF_MODEL in model_keys else 0
+
+    selected_label = st.selectbox(
+        "HF Model", model_labels, index=default_idx, key="model_select", label_visibility="collapsed"
+    )
+    selected_model = model_keys[model_labels.index(selected_label)]
+
+    model_desc = HF_MODELS.get(selected_model, {}).get("description", "")
+    if model_desc:
+        st.markdown(f"<div style='font-size:0.72rem;color:#64748b;margin-top:0.25rem;'>{model_desc}</div>",
+                    unsafe_allow_html=True)
+
+    rag_mode = st.radio(
+        "RAG Mode",
+        ["hybrid", "semantic", "fullylexical"],
+        format_func=lambda x: {
+            "hybrid":       "🔀 Hybrid (Recommended)",
+            "semantic":     "🔵 Semantic Only",
+            "fullylexical": "🔤 Lexical Only",
+        }[x],
+        key="rag_mode_radio",
     )
 
-
-def render_single_view_results(
-    reranked_results: List[Dict[str, Any]],
-    lexical_results: List[Dict[str, Any]],
-    semantic_results: List[Dict[str, Any]],
-    generation: Optional[Dict[str, Any]] = None,
-) -> None:
-    """
-    Render the full RAG output:
-      1. Multiple AI answer cards  — one per provider (Phi-3.5, Groq, Extractive)
-      2. Cited Sources table       — shared across all answers
-      3. Semantic Search Results   — Firestore BGE-M3 vector results (collapsible)
-      4. Reranked Reference Chunks — grounded source passages
-    """
-    # ── Multiple AI Answer Cards ──────────────────────────────────────────────
-    if generation:
-        answers = generation.get("answers", [])
-        citations = generation.get("citations", [])
-
-        # Fallback: wrap legacy flat format into list
-        if not answers and generation.get("answer") and generation.get("provider", "none") != "none":
-            answers = [{"provider_key": "phi35", "answer": generation["answer"]}]
-
-        if answers:
-            # Section header
-            n_cards = len(answers)
-            st.markdown(
-                f'<div style="display:flex; align-items:center; gap:0.6rem; '
-                f'margin-bottom:0.9rem; margin-top:0.3rem;">'
-                f'<span style="font-size:1rem; font-weight:800; color:#f1f5f9;">🤖 LOVA_HR Answers</span>'
-                f'<span style="background:rgba(99,102,241,0.18); color:#a5b4fc; '
-                f'padding:0.15rem 0.55rem; border-radius:20px; font-size:0.73rem; font-weight:600;">'
-                f'{n_cards} output{"s" if n_cards != 1 else ""}</span>'
-                f'</div>',
-                unsafe_allow_html=True,
-            )
-
-            # Render ALL answer cards directly visible on page
-            if len(answers) >= 2:
-                cols = st.columns(min(len(answers), 3))
-                for col, item in zip(cols, answers):
-                    idx = answers.index(item) + 1
-                    style = _PROVIDER_STYLES.get(item["provider_key"], _PROVIDER_STYLES["extractive"])
-                    badge = _PROVIDER_BADGE.get(item["provider_key"], "Free Tier")
-                    safe_text = html.escape(item["answer"]).replace("\n", "<br>")
-                    with col:
-                        st.markdown(
-                            f'<div style="background:linear-gradient(135deg,rgba(15,23,42,0.97),{style["bg"]}); '
-                            f'border:1px solid {style["border"]}; border-radius:12px; '
-                            f'padding:1.15rem; margin-bottom:0.8rem; '
-                            f'box-shadow:0 4px 18px {style["glow"]};">'
-                            f'<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:0.7rem;">'
-                            f'<span style="font-weight:700;color:{style["color"]};font-size:0.92rem;">'
-                            f'{style["icon"]} #{idx} {style["label"]}</span>'
-                            f'<span style="background:{style["badge_bg"]};color:{style["color"]};'
-                            f'padding:0.15rem 0.5rem;border-radius:20px;font-size:0.68rem;font-weight:600;">{badge}</span>'
-                            f'</div>'
-                            f'<div style="color:#e2e8f0;font-size:0.89rem;line-height:1.65;">{safe_text}</div>'
-                            f'</div>',
-                            unsafe_allow_html=True,
-                        )
-            else:
-                for idx, item in enumerate(answers, 1):
-                    _render_answer_card(item["answer"], item["provider_key"], idx)
-
-            # Shared Cited Sources table
-            if citations:
-                cite_rows = "".join(
-                    f'<tr>'
-                    f'<td style="color:#94a3b8;padding:0.18rem 0.6rem;font-size:0.78rem;">#{c["rank"]}</td>'
-                    f'<td style="color:#cbd5e1;padding:0.18rem 0.6rem;font-size:0.78rem;">'
-                    f'🏢 {html.escape(str(c["company"]))} &gt; '
-                    f'📁 {html.escape(str(c["subfolder"]))} &gt; '
-                    f'📄 {html.escape(str(c["filename"]))}</td>'
-                    f'<td style="color:#64748b;padding:0.18rem 0.6rem;font-size:0.78rem;">p.{c["page"]}</td>'
-                    f'<td style="color:#475569;padding:0.18rem 0.6rem;font-size:0.72rem;">'
-                    f'Score: {float(c.get("score",0)):.3f}</td>'
-                    f'</tr>'
-                    for c in citations
-                )
-                st.markdown(
-                    f'<div style="background:rgba(15,23,42,0.8);border:1px solid rgba(255,255,255,0.06);'
-                    f'border-radius:10px;padding:0.8rem 1rem;margin-bottom:1.2rem;">'
-                    f'<div style="font-size:0.75rem;font-weight:700;color:#94a3b8;'
-                    f'margin-bottom:0.5rem;text-transform:uppercase;letter-spacing:0.05em;">📎 Cited Sources (shared)</div>'
-                    f'<table style="width:100%;border-collapse:collapse;">{cite_rows}</table>'
-                    f'</div>',
-                    unsafe_allow_html=True,
-                )
-
-    # ── Semantic Search Results (BGE-M3 / Firestore) ──────────────────────────
-    if semantic_results:
-        with st.expander(
-            f"🔵 Semantic Search Results ({len(semantic_results)} chunks · BGE-M3 · Firestore)",
-            expanded=False,
-        ):
-            for i, res in enumerate(semantic_results, 1):
-                escaped_text = html.escape(res.get("chunk_text", ""))
-                comp  = html.escape(res.get("company",  "General"))
-                sub   = html.escape(res.get("subfolder","General"))
-                fname = html.escape(res.get("filename", "document"))
-                dist  = res.get("distance", res.get("score", None))
-                score_badge = f"Cosine Sim: {float(1 - dist):.4f}" if dist is not None else "Semantic Match"
-                st.markdown(
-                    f'<div class="result-card semantic-card">'
-                    f'<div class="card-header">'
-                    f'<span class="doc-badge">#{i} | 🏢 {comp} &gt; 📁 {sub} &gt; 📄 {fname}</span>'
-                    f'<span class="score-badge semantic-score">{score_badge}</span>'
-                    f'</div>'
-                    f'<div class="card-body">{escaped_text}</div>'
-                    f'</div>',
-                    unsafe_allow_html=True,
-                )
-
-    # ── Grounded References & Source Chunks (Collapsible Dropdown Tab) ────────
-    results = reranked_results if reranked_results else (semantic_results if semantic_results else lexical_results)
-
-    if not results:
-        st.info("No matching document context found for this query.")
-        return
-
-    with st.expander(f"📄 Grounded References & Source Chunks ({len(results)} chunks)", expanded=False):
-        for i, res in enumerate(results, 1):
-            escaped_text = html.escape(res.get("chunk_text", ""))
-            comp  = html.escape(res.get("company",  "General"))
-            sub   = html.escape(res.get("subfolder","General"))
-            fname = html.escape(res.get("filename", "document"))
-            src   = html.escape(res.get("source_file", "—"))
-
-            r_score = res.get("reranker_score")
-            if r_score is not None:
-                score_badge = f"Reranker: {float(r_score):.4f}"
-            elif "rrf_score" in res:
-                score_badge = f"RRF: {float(res['rrf_score']):.4f}"
-            elif "score" in res:
-                score_badge = f"Score: {float(res['score']):.2f}"
-            else:
-                score_badge = "Relevance: Match"
-
-            st.markdown(
-                f'<div class="result-card reranked-card">'
-                f'<div class="card-header">'
-                f'<span class="doc-badge">#{i} | 🏢 {comp} &gt; 📁 {sub} &gt; 📄 {fname}</span>'
-                f'<span class="score-badge reranked-score">{score_badge}</span>'
-                f'</div>'
-                f'<div class="card-body">{escaped_text}</div>'
-                f'<div style="font-size:0.75rem; color:#94a3b8; margin-top:0.6rem; '
-                f'border-top:1px solid rgba(255,255,255,0.08); padding-top:0.4rem;">'
-                f'<strong>Reference Source:</strong> {src}'
-                f'</div>'
-                f'</div>',
-                unsafe_allow_html=True,
-            )
-
-
-# ── Document Setup & State ───────────────────────────────────────────────────
-DATA_DIR = Path("data")
-if not DATA_DIR.exists():
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-
-# Initialize Session State Variables
-if "chunks" not in st.session_state:
-    st.session_state.chunks = []
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-
-# Cache pipeline and retriever (model loading is expensive)
-@st.cache_resource(show_spinner="Loading HR Search Engine & Models...")
-def get_pipeline() -> EmbeddingPipeline:
-    return EmbeddingPipeline()
-
-@st.cache_resource(show_spinner="Loading HR Search Engine & Models...")
-def get_retriever() -> HybridRetriever:
-    return HybridRetriever(pipeline=get_pipeline())
-
-pipeline = get_pipeline()
-retriever = get_retriever()
-
-# Firebase connection status (checked once per session)
-_firebase_status = is_firebase_available()
-
-
-def reindex_knowledge_base(data_dir: Path = DATA_DIR) -> None:
-    """Reload all documents from data_dir, chunk them, and sync with vector store."""
-    docs = load_all_documents(data_dir)
-    if docs:
-        chunks = pipeline.chunk_documents(docs)
-        pipeline.sync_vector_store(chunks)
-    else:
-        pipeline.invalidate_bm25_cache()
-
-# Helpers
-def get_existing_companies(data_dir: Path = DATA_DIR) -> List[str]:
-    """List all company folder names under data/."""
-    if not data_dir.exists():
-        return []
-    return sorted([
-        d.name for d in data_dir.iterdir()
-        if d.is_dir() and d.name not in ["chroma_db", "chroma_test"]
-    ])
-
-def get_company_subfolders(company: str, data_dir: Path = DATA_DIR) -> List[str]:
-    """List all subfolder names under a company's directory.
-
-    Always includes 'General' so callers always get at least one entry,
-    even when no subdirectories exist on disk.
-    """
-    if not company or company == "All Companies":
-        return ["General"]
-    comp_dir = data_dir / company
-    if not comp_dir.exists() or not comp_dir.is_dir():
-        return ["General"]
-    try:
-        subdirs = sorted({
-            p.relative_to(comp_dir).as_posix()
-            for p in comp_dir.glob("**/*")
-            if p.is_dir()
-        })
-    except Exception:
-        subdirs = []
-    # Always surface 'General' first, then any real subdirectories
-    result = ["General"] + [s for s in subdirs if s != "General"]
-    return result
-
-def get_all_indexed_files(data_dir: Path = DATA_DIR) -> List[Path]:
-    """Gather all supported document files organized by company/subfolders."""
-    extensions = ["*.pdf", "*.txt", "*.docx"]
-    files = []
-    companies = get_existing_companies(data_dir)
-    for company in companies:
-        comp_path = data_dir / company
-        for ext in extensions:
-            files.extend(comp_path.glob(f"**/{ext}"))
-    return sorted(files)
-
-def format_size(size_in_bytes: int) -> str:
-    """Format file size in human-readable unit."""
-    if size_in_bytes < 1024:
-        return f"{size_in_bytes} B"
-    elif size_in_bytes < 1024 * 1024:
-        return f"{size_in_bytes / 1024:.1f} KB"
-    else:
-        return f"{size_in_bytes / (1024 * 1024):.1f} MB"
-
-def get_document_state_hash() -> str:
-    """Compute a md5 hash representing the current set of documents (names, sizes, mtimes)."""
-    files = get_all_indexed_files()
-    sig = []
-    for f in files:
-        try:
-            stat = f.stat()
-            # Include relative path from DATA_DIR to uniquely represent file state
-            rel = f.relative_to(DATA_DIR)
-            sig.append(f"{rel}:{stat.st_size}:{stat.st_mtime}")
-        except Exception:
-            pass
-    return hashlib.md5("|".join(sig).encode("utf-8")).hexdigest()
-
-@st.cache_data(show_spinner=False)
-def load_and_chunk_cached(doc_hash: str) -> List[Any]:
-    """Cache loaded & split document chunks in memory by doc_hash."""
-    docs = load_all_documents(str(DATA_DIR))
-    return pipeline.chunk_documents(docs)
-
-def reindex_knowledge_base(force_clear: bool = False):
-    """Load, chunk, and index the current set of documents into Firestore."""
-    if force_clear:
-        pipeline.vector_store.clear()
-        st.cache_data.clear()
-
-    files = get_all_indexed_files()
-    current_hash = get_document_state_hash()
-    if not files:
-        st.session_state.chunks = []
-        st.session_state.doc_hash = current_hash
-        return
-
-    with st.spinner("⏳ Updating search indexes (Firestore + BM25)..."):
-        # Fast cached chunk retrieval (instant if doc_hash is unchanged)
-        chunks = load_and_chunk_cached(current_hash)
-        # Sync to Firestore (idempotent, skips existing chunks)
-        pipeline.sync_vector_store(chunks)
-        # Invalidate BM25 cache so new docs are picked up
-        pipeline.invalidate_bm25_cache()
-
-        # Save to session state
-        st.session_state.chunks = chunks
-        st.session_state.doc_hash = current_hash
-
-# Legacy Folder Migration
-def migrate_legacy_folders():
-    """Migrate legacy folders to company-based organization on startup."""
-    legacy_pdf = DATA_DIR / "pdf_files"
-    migrated = False
-
-    if legacy_pdf.exists() and legacy_pdf.is_dir():
-        # 1. TCS policies
-        tcs_file = legacy_pdf / "tcs_hr_policies.pdf"
-        if tcs_file.exists():
-            dest = DATA_DIR / "TCS" / "Policies"
-            dest.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(tcs_file), str(dest / tcs_file.name))
-            migrated = True
-
-        # 2. HCLTech blueprint
-        hcl_file = legacy_pdf / "hcltech_extended_hr_blueprint.pdf"
-        if hcl_file.exists():
-            dest = DATA_DIR / "HCLTech" / "Blueprint"
-            dest.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(hcl_file), str(dest / hcl_file.name))
-            migrated = True
-
-        # 3. Code of conduct
-        coc_file = legacy_pdf / "codeofconduct.pdf"
-        if coc_file.exists():
-            dest = DATA_DIR / "General" / "CodeOfConduct"
-            dest.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(coc_file), str(dest / coc_file.name))
-            migrated = True
-
-        try:
-            _safe_rmtree(legacy_pdf)
-        except Exception:
-            pass
-
-    legacy_txt = DATA_DIR / "txt_files"
-    if legacy_txt.exists() and legacy_txt.is_dir():
-        try:
-            shutil.rmtree(legacy_txt)
-        except Exception:
-            pass
-        migrated = True
-
-    if migrated:
-        st.toast("Migrated legacy folders to Company layout!")
-        reindex_knowledge_base(force_clear=True)
-
-# Run legacy migration once on startup
-if "migrated" not in st.session_state:
-    migrate_legacy_folders()
-    st.session_state.migrated = True
-
-def sanitize_folder_name(name: str) -> str:
-    """Remove invalid path characters for cross-platform folder safety."""
-    cleaned = re.sub(r'[\\/:*?"<>|]', "", name).strip()
-    return cleaned
-
-
-# Auto-reindex on startup or file-system changes
-current_hash = get_document_state_hash()
-if "doc_hash" not in st.session_state or st.session_state.doc_hash != current_hash or (not st.session_state.chunks and get_all_indexed_files()):
-    reindex_knowledge_base()
-
-# ── Sidebar layout ────────────────────────────────────────────────────────────
-with st.sidebar:
-    st.markdown('<div class="sidebar-title">🏢 LOVA_HR Settings</div>', unsafe_allow_html=True)
-    
-    # Sidebar Navigation Tabs
-    sb_tab1, sb_tab2, sb_tab3 = st.tabs(["🔍 Scope", "📤 Upload", "⚙️ Manage"])
-
-    # ──────────────────────────────────────────
-    # TAB 1: SEARCH SCOPE CONTROLLER
-    # ──────────────────────────────────────────
-    with sb_tab1:
-        st.markdown("**Active Search Scope**")
-        
-        companies = get_existing_companies()
-        scope_companies = ["All Companies"] + companies
-        
-        if "search_company" in st.session_state and st.session_state.search_company not in scope_companies:
-            st.session_state.search_company = "All Companies"
-        
-        search_company = st.selectbox(
-            "Company Scope",
-            scope_companies,
-            index=0,
-            key="search_company"
-        )
-        
-        # Reset subfolder scope if company selection changes
-        if "last_search_company" not in st.session_state:
-            st.session_state.last_search_company = search_company
-
-        if st.session_state.last_search_company != search_company:
-            st.session_state.search_subfolder = "All Subfolders"
-            st.session_state.last_search_company = search_company
-
-        search_subfolder = "All Subfolders"
-        if search_company != "All Companies":
-            subfolders = get_company_subfolders(search_company)
-            scope_subfolders = ["All Subfolders"] + subfolders
-            
-            if "search_subfolder" in st.session_state and st.session_state.search_subfolder not in scope_subfolders:
-                st.session_state.search_subfolder = "All Subfolders"
-
-            search_subfolder = st.selectbox(
-                "Subfolder Scope",
-                scope_subfolders,
-                index=0,
-                key="search_subfolder"
-            )
-        
-        st.divider()
-        st.markdown("**Search Settings**")
-        top_k = st.slider(
-            "Top Chunks to Retrieve", 1, 5, 3,
-            help="Number of context passages to retrieve for Lexical and Semantic searches separately."
-        )
-        st.divider()
-        st.markdown("**AI Answer Settings**")
-        max_providers = st.slider(
-            "Total Answer Outputs",
-            min_value=1,
-            max_value=3,
-            value=3,
-            step=1,
-            help=(
-                "Adjust how many total model outputs to generate and display:\n"
-                "1 → 🧠 Phi-3.5-mini-instruct\n"
-                "2 → 🧠 Phi-3.5 + ⚡ Llama-3.1\n"
-                "3 → 🧠 Phi-3.5 + ⚡ Llama-3.1 + 📋 Extractive Baseline"
-            ),
-        )
-        provider_labels = {
-            1: "1 Output: 🧠 Phi-3.5-mini-instruct",
-            2: "2 Outputs: 🧠 Phi-3.5 + ⚡ Llama-3.1",
-            3: "3 Outputs: 🧠 Phi-3.5 + ⚡ Llama-3.1 + 📋 Extractive",
-        }
-        st.caption(provider_labels.get(max_providers, ""))
-
-    # ──────────────────────────────────────────
-    # TAB 2: ADD DOCUMENTS (UPLOADER)
-    # ──────────────────────────────────────────
-    with sb_tab2:
-        st.markdown("**Add Files to Library**")
-        existing_comps = get_existing_companies()
-        
-        if not existing_comps:
-            st.info("No companies exist yet. Create your first company below:")
-            with st.form("quick_create_company", clear_on_submit=True):
-                quick_comp_name = st.text_input("New Company Name")
-                if st.form_submit_button("✨ Create Company", use_container_width=True, type="primary"):
-                    clean_comp = sanitize_folder_name(quick_comp_name)
-                    if clean_comp:
-                        (DATA_DIR / clean_comp / "General").mkdir(parents=True, exist_ok=True)
-                        st.toast(f"Created company '{clean_comp}'")
-                        st.rerun()
-                    else:
-                        st.error("Please enter a valid company name.")
-        else:
-            company_options = existing_comps + ["+ Create New Company"]
-
-            if "upload_company" in st.session_state and st.session_state.upload_company not in company_options:
-                st.session_state.upload_company = company_options[0]
-
-            upload_company = st.selectbox(
-                "Select Destination Company",
-                company_options,
-                key="upload_company"
-            )
-            
-            final_company = upload_company
-            if upload_company == "+ Create New Company":
-                raw_company_inline = st.text_input("New Company Name", value="", key="inline_new_comp")
-                final_company = sanitize_folder_name(raw_company_inline)
-            
-            # Reset upload_subfolder if upload_company changes
-            if "last_upload_company" not in st.session_state:
-                st.session_state.last_upload_company = final_company
-            if st.session_state.last_upload_company != final_company:
-                if "upload_subfolder" in st.session_state:
-                    del st.session_state["upload_subfolder"]
-                st.session_state.last_upload_company = final_company
-
-            subfolders = get_company_subfolders(final_company) if final_company else ["General"]
-            options_subfolder = subfolders + ["+ Create New Subfolder"]
-
-            if "upload_subfolder" in st.session_state and st.session_state.upload_subfolder not in options_subfolder:
-                st.session_state.upload_subfolder = options_subfolder[0]
-
-            upload_subfolder = st.selectbox(
-                "Select Destination Subfolder",
-                options_subfolder,
-                key="upload_subfolder"
-            )
-            
-            final_subfolder = upload_subfolder
-            if upload_subfolder == "+ Create New Subfolder":
-                raw_subfolder = st.text_input(
-                    "New Subfolder Name",
-                    value="",
-                    key="new_subfolder_inline"
-                )
-                final_subfolder = sanitize_folder_name(raw_subfolder)
-                
-            uploaded_files = st.file_uploader(
-                "Select document (.txt, .pdf, .docx)",
-                type=["txt", "pdf", "docx"],
-                accept_multiple_files=True,
-                key="doc_uploader"
-            )
-            
-            if st.button("📤 Upload and Index", use_container_width=True, type="primary"):
-                if not final_company:
-                    st.error("Please specify a valid company name!")
-                elif not final_subfolder:
-                    st.error("Please specify a valid subfolder name!")
-                elif not uploaded_files:
-                    st.error("No files selected!")
-                else:
-                    dest_dir = DATA_DIR / final_company / final_subfolder
-                    dest_dir.mkdir(parents=True, exist_ok=True)
-                    
-                    with st.spinner(f"⚡ Processing {len(uploaded_files)} document(s)..."):
-                        files_saved = False
-                        for uf in uploaded_files:
-                            target_file = dest_dir / uf.name
-                            with open(target_file, "wb") as f:
-                                f.write(uf.getbuffer())
-                            files_saved = True
-                            
-                        if files_saved:
-                            st.cache_data.clear()
-                            reindex_knowledge_base()
-                            st.toast(f"Successfully uploaded & indexed {len(uploaded_files)} file(s)!")
-                            st.rerun()
-
-    # ──────────────────────────────────────────
-    # TAB 3: MANAGE COMPANIES & SUBFOLDERS
-    # ──────────────────────────────────────────
-    with sb_tab3:
-        st.markdown("**Manage Folders**")
-        
-        # Form to Create Company
-        with st.form("create_company_form", clear_on_submit=True):
-            st.markdown("Create New Company")
-            raw_comp = st.text_input("Company Name")
-            if st.form_submit_button("✨ Create Company", use_container_width=True, type="primary"):
-                new_comp = sanitize_folder_name(raw_comp)
-                if new_comp:
-                    # Create default general subfolder on local disk
-                    (DATA_DIR / new_comp / "General").mkdir(parents=True, exist_ok=True)
-                    st.cache_data.clear()
-                    reindex_knowledge_base()
-                    st.toast(f"Created company '{new_comp}' on local disk & Firebase!")
-                    st.rerun()
-                else:
-                    st.error("Please enter a valid company name.")
-
-        companies = get_existing_companies()
-        if companies:
-            st.divider()
-            st.markdown("Company Operations")
-
-            if "manage_comp" in st.session_state and st.session_state.manage_comp not in companies:
-                st.session_state.manage_comp = companies[0]
-
-            manage_comp = st.selectbox("Select Company", companies, key="manage_comp")
-            
-            # Form to Create Subfolder in Selected Company
-            with st.form("create_subfolder_form", clear_on_submit=True):
-                st.markdown(f"Create New Subfolder in '{manage_comp}'")
-                raw_sub = st.text_input("Subfolder Name")
-                if st.form_submit_button("✨ Create Subfolder", use_container_width=True):
-                    new_sub = sanitize_folder_name(raw_sub)
-                    if new_sub:
-                        (DATA_DIR / manage_comp / new_sub).mkdir(parents=True, exist_ok=True)
-                        st.cache_data.clear()
-                        reindex_knowledge_base()
-                        st.toast(f"Created subfolder '{new_sub}' in '{manage_comp}' on local disk & Firebase!")
-                        st.rerun()
-                    else:
-                        st.error("Please enter a valid subfolder name.")
-
-            # Reset manage_sub if manage_comp changes
-            if "last_manage_comp" not in st.session_state:
-                st.session_state.last_manage_comp = manage_comp
-            if st.session_state.last_manage_comp != manage_comp:
-                if "manage_sub" in st.session_state:
-                    del st.session_state["manage_sub"]
-                st.session_state.last_manage_comp = manage_comp
-
-            # Delete Company Button
-            if st.button("🗑️ Delete Company", type="secondary", use_container_width=True):
-                comp_dir = DATA_DIR / manage_comp
-                # 1. Delete all vector chunks for this company from Firebase & memory
-                pipeline.vector_store.delete_company_chunks(manage_comp)
-
-                # 2. Delete company directory from local disk
-                if comp_dir.exists():
-                    _safe_rmtree(comp_dir)
-
-                # 3. Invalidate BM25 cache
-                pipeline.invalidate_bm25_cache()
-
-                # 4. Clean session state keys for the deleted company
-                for key in ["manage_comp", "upload_company", "search_company"]:
-                    if key in st.session_state and st.session_state[key] == manage_comp:
-                        del st.session_state[key]
-
-                st.toast(f"Deleted company '{manage_comp}' from local disk & Firebase")
-                st.cache_data.clear()
-                reindex_knowledge_base()
-                st.rerun()
-                
-            st.markdown("Subfolder Operations")
-            subfolders = get_company_subfolders(manage_comp)  # always non-empty
-
-            if "manage_sub" in st.session_state and st.session_state.manage_sub not in subfolders:
-                st.session_state.manage_sub = subfolders[0]
-
-            manage_sub = st.selectbox("Select Subfolder", subfolders, key="manage_sub")
-            
-            # Delete Subfolder Button
-            if st.button("🗑️ Delete Subfolder", type="secondary", use_container_width=True):
-                if manage_sub == "General":
-                    st.error(
-                        "'General' is the default subfolder and cannot be deleted. "
-                        "Delete individual files instead, or delete the whole company."
-                    )
-                else:
-                    sub_dir = DATA_DIR / manage_comp / manage_sub
-                    # 1. Delete all vector chunks for this subfolder from Firebase & memory
-                    pipeline.vector_store.delete_subfolder_chunks(manage_comp, manage_sub)
-
-                    # 2. Delete subfolder directory from local disk
-                    if sub_dir.exists():
-                        _safe_rmtree(sub_dir)
-
-                    # 3. Invalidate BM25 cache
-                    pipeline.invalidate_bm25_cache()
-
-                    # 4. Clean session state keys for the deleted subfolder
-                    for key in ["manage_sub", "upload_subfolder", "search_subfolder"]:
-                        if key in st.session_state and st.session_state[key] == manage_sub:
-                            del st.session_state[key]
-
-                    st.toast(f"Deleted subfolder '{manage_sub}' from '{manage_comp}' on local disk & Firebase")
-                    st.cache_data.clear()
-                    reindex_knowledge_base()
-                    st.rerun()
-                
-    # ── Firebase Status Indicator ─────────────────────────────────────────────
-    st.divider()
-    if _firebase_status:
-        st.markdown(
-            '<span class="firebase-badge firebase-online">🔥 Firebase Connected</span>',
-            unsafe_allow_html=True,
-        )
-    else:
-        st.markdown(
-            '<span class="firebase-badge firebase-offline">⚠️ Firebase Offline (BM25 only)</span>',
-            unsafe_allow_html=True,
-        )
-        st.caption("Place `serviceAccountKey.json` in repo root to enable semantic search.")
-
-    # ── Document Library View (Sidebar Bottom) ────────────────────────────────
-    st.divider()
-    st.markdown("**Document Library**")
-    
-    files = get_all_indexed_files()
-    if not files:
-        st.info("No documents in the library.")
-    else:
-        # Group files by Company > Subfolder
-        library_data: Dict[str, Dict[str, List[Path]]] = {}
-        for f in files:
-            # Structure is: data / company / subfolder / filename
+    use_local = st.toggle(
+        "Use Local Transformers",
+        value=True,
+        key="local_engine",
+        help="Run locally via transformers (no cloud API needed).",
+    )
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    # Search params
+    st.markdown('<div class="sidebar-section">', unsafe_allow_html=True)
+    st.markdown('<div class="sidebar-section-title">⚙️ Search Parameters</div>', unsafe_allow_html=True)
+    top_k        = st.slider("Top Results (K)", 1, 10, 5, key="top_k_slider")
+    rerank_top_n = st.slider("Rerank Top N",    1, 10, 5, key="rerank_n_slider")
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    # Upload
+    st.markdown('<div class="sidebar-section">', unsafe_allow_html=True)
+    st.markdown('<div class="sidebar-section-title">📁 Document Upload</div>', unsafe_allow_html=True)
+    _upload_companies = (
+        sorted([d.name for d in (ROOT / "data").iterdir() if d.is_dir()])
+        if (ROOT / "data").exists() else []
+    )
+    if not _upload_companies:
+        _upload_companies = ["General"]
+    _up_default = selected_company if selected_company in _upload_companies else _upload_companies[0]
+    upload_company = st.selectbox(
+        "Upload to Company", _upload_companies,
+        index=_upload_companies.index(_up_default), key="upload_company_select",
+    )
+    uploaded = st.file_uploader(
+        "Upload HR Policies", type=["pdf", "txt", "docx"],
+        accept_multiple_files=True, key="doc_uploader", label_visibility="collapsed",
+    )
+    if uploaded and st.button("📥 Index Documents", key="index_btn", use_container_width=True):
+        with st.spinner("Indexing documents..."):
             try:
-                rel = f.relative_to(DATA_DIR)
-                comp = rel.parts[0]
-                sub = rel.parts[1]
-                if comp not in library_data:
-                    library_data[comp] = {}
-                if sub not in library_data[comp]:
-                    library_data[comp][sub] = []
-                library_data[comp][sub].append(f)
-            except Exception:
-                pass
+                retriever = get_retriever()
+                all_docs = []
+                tenant = upload_company
+                upload_dir = ROOT / "data" / tenant
+                upload_dir.mkdir(parents=True, exist_ok=True)
+                for f in uploaded:
+                    dest = upload_dir / f.name
+                    dest.write_bytes(f.getvalue())
+                from src.data_loader import _load_pdfs, _load_txts, _load_docx
+                all_docs += _load_pdfs(upload_dir)
+                all_docs += _load_txts(upload_dir)
+                all_docs += _load_docx(upload_dir)
+                if all_docs:
+                    retriever.pipeline.add_documents(all_docs)
+                    st.session_state.docs_indexed += len(all_docs)
+                    store = retriever.pipeline.vector_store
+                    if store.is_online:
+                        st.success(
+                            f"Indexed {len(all_docs)} chunks for '{tenant}' — saved to "
+                            f"data/{tenant}/ and synced to Firestore."
+                        )
+                    else:
+                        st.warning(
+                            f"Indexed {len(all_docs)} chunks for '{tenant}' locally in "
+                            f"data/{tenant}/. Firebase is offline — use 'Sync to Firebase' "
+                            "to upload them later."
+                        )
+                else:
+                    st.warning("No processable content found.")
+            except Exception as exc:
+                st.error(f"Indexing error: {exc}")
+
+    if st.button("🔄 Sync Local Files to Firebase", key="sync_btn", use_container_width=True):
+        with st.spinner("Syncing to Firebase..."):
+            try:
+                retriever = get_retriever()
+                store = retriever.pipeline.vector_store
+                if not store.is_online:
+                    st.warning("Firebase is offline — cannot sync to Firestore right now.")
+                else:
+                    chunks = store.get_all_chunks()
+                    store.upsert_chunks(chunks)
+                    st.success(f"Synced {len(chunks)} chunks to Firestore.")
+            except Exception as exc:
+                st.error(f"Sync error: {exc}")
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    # Stats
+    st.markdown('<div class="sidebar-section">', unsafe_allow_html=True)
+    st.markdown('<div class="sidebar-section-title">📊 Session Stats</div>', unsafe_allow_html=True)
+    st.metric("Queries", len(st.session_state.chat_history))
+    st.metric("Indexed Chunks", st.session_state.docs_indexed)
+    if st.button("🗑️ Clear Chat", key="clear_chat", use_container_width=True):
+        st.session_state.chat_history = []
+        st.session_state.last_result  = None
+        st.rerun()
+    st.markdown("</div>", unsafe_allow_html=True)
+
+
+# ── Main tabs ─────────────────────────────────────────────────────────────────
+def render_chunks(tab, chunks, max_n=10):
+    """Render a list of retrieval chunks inside a Streamlit tab."""
+    with tab:
+        if not chunks:
+            st.info("No results in this category.")
+            return
+        for i, chunk in enumerate(chunks[:max_n], 1):
+            score = chunk.get("reranker_score", chunk.get("rrf_score", chunk.get("bm25_score", 0)))
+            s_str = f"{score:.4f}" if isinstance(score, float) else str(score)
+            with st.expander(f"#{i} — {chunk.get('filename','?')} p.{chunk.get('page_number','')} (Score: {s_str})"):
+                st.markdown(f"**Company:** {chunk.get('company','')}")
+                st.markdown(f"**Section:** {chunk.get('section_header', chunk.get('subtopic',''))}")
+                st.markdown("---")
+                st.markdown(chunk.get("chunk_text", ""))
+
+
+# ── Sticky Tab Strip ─────────────────────────────────────────────────────────
+st.markdown('<div class="sticky-tabs">', unsafe_allow_html=True)
+tab_search, tab_history, tab_docs = st.tabs(["🔍 Search", "🕘 History", "📚 Documents"])
+st.markdown('</div>', unsafe_allow_html=True)
+
+
+# ── Search tab (Chat Interface) ────────────────────────────────────────────────
+with tab_search:
+    # Render full chat history
+    for turn in st.session_state.chat_history:
+        # User message
+        with st.chat_message("user", avatar="🧑"):
+            st.markdown(turn["query"])
+
+        # Assistant message
+        result = turn["result"]
+        gen = result.get("generation", {})
+        answers = gen.get("answers", [])
+        citations = gen.get("citations", [])
+        is_multi_company = gen.get("multi_company", False)
+
+        with st.chat_message("assistant", avatar="🤖"):
+            if is_multi_company:
+                # ── Multi-Company Comparison Format ────────────────────────
+                companies = gen.get("companies", [])
+                company_groups = gen.get("company_groups", {})
                 
-        # Render grouped files
-        for comp, subs in library_data.items():
-            with st.container(border=True):
-                safe_comp = html.escape(comp)
-                st.markdown(f'<div class="company-title">🏢 {safe_comp}</div>', unsafe_allow_html=True)
-                for sub, paths in subs.items():
-                    safe_sub = html.escape(sub)
-                    st.markdown(f'<div class="subfolder-title">📁 {safe_sub}</div>', unsafe_allow_html=True)
-                    for path in paths:
-                        size_str = format_size(path.stat().st_size)
-                        raw_name = path.name
-                        short_name = raw_name if len(raw_name) < 18 else raw_name[:15] + "..."
-                        safe_short_name = html.escape(short_name)
-                        safe_full_name = html.escape(raw_name)
-                        
-                        col_info, col_del = st.columns([8, 2])
-                        with col_info:
-                            st.markdown(
-                                f'<div class="file-item">'
-                                f'<span class="file-info" title="{safe_full_name}">📄 {safe_short_name} <span class="file-size">({size_str})</span></span>'
-                                f'</div>',
-                                unsafe_allow_html=True
-                            )
-                        with col_del:
-                            if st.button("❌", key=f"del_{comp}_{sub}_{path.name}", help=f"Delete {path.name}"):
-                                try:
-                                    # 1. Delete from Firestore using absolute path
-                                    pipeline.vector_store.delete_file_chunks(str(path.resolve()))
-                                    # 2. Invalidate BM25 cache
-                                    pipeline.invalidate_bm25_cache()
-                                    # 3. Delete file
-                                    if path.exists():
-                                        path.unlink()
-                                    st.toast(f"Removed {raw_name}")
-                                    reindex_knowledge_base()
-                                    st.rerun()
-                                except Exception as e:
-                                    st.error(f"Error: {e}")
-
-# ── Main Chat Interface ───────────────────────────────────────────────────────
-st.markdown(
-    """
-    <div class="hero-container">
-        <h1 class="hero-title">LOVA_HR ⚡</h1>
-        <div class="hero-subtitle">Firebase · BGE-M3 · RRF Fusion · BGE Reranker · Phi-3.5-mini-instruct</div>
+                # Multi-company badge
+                company_tags = " ".join([
+                    f'<span class="company-tag">{c}</span>' for c in companies[:5]
+                ])
+                st.markdown(
+                    f'<div class="multi-company-badge">📊 Comparing {len(companies)} companies</div>'
+                    f'<div style="margin: 0.5rem 0;">{company_tags}</div>',
+                    unsafe_allow_html=True,
+                )
+                
+                # Render each section with specific styling
+                for ans in answers:
+                    bc = ans.get("badge_color", "#6366f1")
+                    icon = ans.get("icon", "🤖")
+                    label = ans.get("label", "Policy Processor")
+                    section_type = ans.get("section_type", "general")
+                    text = ans.get("answer", "").replace("\n", "<br>")
+                    rgb = _hex_to_rgb(bc)
+                    
+                    # Use specific CSS class based on section type
+                    card_class = {
+                        "general": "multi-company-general",
+                        "differences": "multi-company-diff",
+                        "summary": "multi-company-summary",
+                    }.get(section_type, "answer-card")
+                    
+                    st.markdown(f"""
+<div class="{card_class}">
+    <div class="answer-card-header">
+        <span style="font-size:1.2rem;">{icon}</span>
+        <span class="provider-badge"
+              style="background:rgba({rgb},0.15);color:{bc};border:1px solid {bc}40;">
+            {label}
+        </span>
     </div>
-    """,
-    unsafe_allow_html=True,
-)
+    <div class="answer-text">{text}</div>
+</div>""", unsafe_allow_html=True)
+                
+                # Company groups in expandable sections
+                if company_groups:
+                    with st.expander("🏢 Company Policy Details", expanded=False):
+                        for company, comp_chunks in company_groups.items():
+                            st.markdown(f"**{company}**")
+                            for chunk in comp_chunks[:2]:
+                                chunk_text = chunk.get("chunk_text", "")[:500]
+                                st.markdown(f"""
+<div class="citation-card">
+    <div style="font-size:0.82rem;color:#94a3b8;">
+        {chunk.get('filename', 'Policy')} — p.{chunk.get('page_number', '')}
+    </div>
+    <div style="font-size:0.85rem;margin-top:0.4rem;">{chunk_text}</div>
+</div>""", unsafe_allow_html=True)
+                            st.markdown("---")
+            
+            else:
+                # ── Standard Single-Company Format ────────────────────────
+                for ans in answers:
+                    bc = ans.get("badge_color", "#6366f1")
+                    icon = ans.get("icon", "🤖")
+                    label = ans.get("label", "Policy Processor")
+                    text = ans.get("answer", "").replace("\n", "<br>")
+                    rgb = _hex_to_rgb(bc)
+                    st.markdown(f"""
+<div class="answer-card">
+    <div class="answer-card-header">
+        <span style="font-size:1.2rem;">{icon}</span>
+        <span class="provider-badge"
+              style="background:rgba({rgb},0.15);color:{bc};border:1px solid {bc}40;">
+            {label}
+        </span>
+    </div>
+    <div class="answer-text">{text}</div>
+</div>""", unsafe_allow_html=True)
 
-# Display Active Search Scope Banner
-scope_text = "All Companies"
-if search_company != "All Companies":
-    scope_text = f"🏢 {search_company}"
-    if search_subfolder != "All Subfolders":
-        scope_text += f" &nbsp;>&nbsp; 📁 {search_subfolder}"
+            if citations:
+                with st.expander(f"📚 Source Citations ({len(citations)})", expanded=True):
+                    for cit in citations:
+                        score = cit.get("score", 0)
+                        score_str = f"{score:.3f}" if isinstance(score, float) else str(score)
+                        fname = cit.get("filename", "Unknown")
+                        page = cit.get("page", "")
+                        sec = cit.get("section_header", "")
+                        rank = cit.get("rank", "?")
+                        st.markdown(f"""
+<div class="citation-card">
+    <strong>#{rank} — {fname}</strong>
+    <span style="color:#94a3b8;font-size:0.8rem;margin-left:0.5rem;">
+        p.{page} &bull; {sec} &bull; Score: {score_str}
+    </span>
+</div>""", unsafe_allow_html=True)
 
-st.markdown(
-    f'<div class="scope-banner">'
-    f'<span class="scope-label">Active Scope:</span>'
-    f'<span>{scope_text}</span>'
-    f'</div>',
-    unsafe_allow_html=True
-)
-
-# Render Conversation History
-for idx, msg in enumerate(st.session_state.messages):
-    with st.chat_message(msg["role"]):
-        if msg["role"] == "user":
-            st.markdown(msg["content"])
-        else:
-            if msg.get("content"):
-                st.warning(msg["content"])
-            if msg.get("error"):
-                st.error(msg["error"])
-
-            lexical_results  = msg.get("lexical_results", [])
-            semantic_results = msg.get("semantic_results", [])
-            reranked_results = msg.get("reranked_results", [])
-            generation       = msg.get("generation", {})
-
-            if lexical_results or semantic_results or reranked_results or generation:
-                render_single_view_results(
-                    reranked_results=reranked_results,
-                    lexical_results=lexical_results,
-                    semantic_results=semantic_results,
-                    generation=generation,
+            if result.get("mode") == "bm25_only":
+                st.markdown(
+                    '<span class="status-badge status-warning">'
+                    "⚠️ BM25-only — Configure Firebase for full semantic search"
+                    "</span>",
+                    unsafe_allow_html=True,
                 )
 
-# Chat Input Handler
-if query := st.chat_input("Ask a question about the documents in scope…"):
-    
-    # User turn
-    st.session_state.messages.append({"role": "user", "content": query})
-    with st.chat_message("user"):
-        st.markdown(query)
-        
-    # Assistant turn
-    with st.chat_message("assistant"):
-        if not st.session_state.chunks and not _firebase_status:
-            st.warning("Document library is empty. Please upload documents in the sidebar first.")
-            st.session_state.messages.append({
-                "role": "assistant",
-                "content": "Document library is empty. Please upload documents in the sidebar first.",
-                "lexical_results": [],
-                "semantic_results": [],
-                "reranked_results": [],
-                "error": None,
-            })
-        else:
-            with st.spinner("🔍 Querying Firebase · BM25 · BGE Reranker · Phi-3.5-mini-instruct…"):
-                search_response = retriever.search(
-                    query=query,
-                    top_k=top_k,
-                    company=search_company,
-                    subfolder=search_subfolder,
-                    rerank_top_n=5,
-                    max_providers=max_providers,
+            # Detailed retrieval results
+            with st.expander("🔍 Detailed Results", expanded=False):
+                detail_r, detail_l, detail_s = st.tabs(["🔀 Reranked", "🔤 Lexical", "🔵 Semantic"])
+                render_chunks(detail_r, result.get("reranked", []))
+                render_chunks(detail_l, result.get("lexical", []))
+                render_chunks(detail_s, result.get("semantic", []))
+
+
+# ── History tab (all conversations) ───────────────────────────────────────────
+with tab_history:
+    st.markdown("### 🕘 Conversation History")
+    history = st.session_state.chat_history
+    if not history:
+        st.info("No conversations yet. Ask a question from the Search tab.")
+    else:
+        st.caption(f"{len(history)} saved question(s) in this conversation.")
+        for i, turn in enumerate(reversed(history)):
+            with st.expander(f"#{len(history) - i} — {turn['query'][:70]}{'…' if len(turn['query']) > 70 else ''}", expanded=False):
+                st.markdown(f"**❓ {turn['query']}**")
+                st.markdown("---")
+                result = turn["result"]
+                gen = result.get("generation", {})
+                answers = gen.get("answers", [])
+                citations = gen.get("citations", [])
+                is_multi_company = gen.get("multi_company", False)
+
+                if is_multi_company:
+                    companies = gen.get("companies", [])
+                    company_tags = " ".join([
+                        f'<span class="company-tag">{c}</span>' for c in companies[:5]
+                    ])
+                    st.markdown(
+                        f'<div class="multi-company-badge">📊 Comparing {len(companies)} companies</div>'
+                        f'<div style="margin: 0.5rem 0;">{company_tags}</div>',
+                        unsafe_allow_html=True,
+                    )
+
+                for ans in answers:
+                    bc = ans.get("badge_color", "#6366f1")
+                    icon = ans.get("icon", "🤖")
+                    label = ans.get("label", "Policy Processor")
+                    section_type = ans.get("section_type", "general")
+                    text = ans.get("answer", "").replace("\n", "<br>")
+                    rgb = _hex_to_rgb(bc)
+                    
+                    card_class = {
+                        "general": "multi-company-general",
+                        "differences": "multi-company-diff",
+                        "summary": "multi-company-summary",
+                    }.get(section_type, "answer-card") if is_multi_company else "answer-card"
+                    
+                    st.markdown(f"""
+<div class="{card_class}">
+    <div class="answer-card-header">
+        <span style="font-size:1.2rem;">{icon}</span>
+        <span class="provider-badge"
+              style="background:rgba({rgb},0.15);color:{bc};border:1px solid {bc}40;">
+            {label}
+        </span>
+    </div>
+    <div class="answer-text">{text}</div>
+</div>""", unsafe_allow_html=True)
+
+                if citations:
+                    st.markdown("**📚 Sources**")
+                    for cit in citations:
+                        score = cit.get("score", 0)
+                        score_str = f"{score:.3f}" if isinstance(score, float) else str(score)
+                        fname = cit.get("filename", "Unknown")
+                        page = cit.get("page", "")
+                        sec = cit.get("section_header", "")
+                        rank = cit.get("rank", "?")
+                        st.markdown(f"""
+<div class="citation-card">
+    <strong>#{rank} — {fname}</strong>
+    <span style="color:#94a3b8;font-size:0.8rem;margin-left:0.5rem;">
+        p.{page} &bull; {sec} &bull; Score: {score_str}
+    </span>
+</div>""", unsafe_allow_html=True)
+
+                with st.expander("🔍 Detailed Results", expanded=False):
+                    detail_r, detail_l, detail_s = st.tabs(["🔀 Reranked", "🔤 Lexical", "🔵 Semantic"])
+                    render_chunks(detail_r, result.get("reranked", []))
+                    render_chunks(detail_l, result.get("lexical", []))
+                    render_chunks(detail_s, result.get("semantic", []))
+
+                if st.button("🗑️ Delete", key=f"hist_del_{i}", use_container_width=True):
+                    del st.session_state.chat_history[len(history) - 1 - i]
+                    if not st.session_state.chat_history:
+                        st.session_state.last_result = None
+                    st.rerun()
+
+
+# ── Documents tab ─────────────────────────────────────────────────────────────
+def _delete_document(fpath: Path) -> None:
+    """Delete a file on disk and all of its indexed chunks (memory + Firestore)."""
+    try:
+        retriever = get_retriever()
+        retriever.pipeline.vector_store.delete_file_chunks(str(fpath.resolve()))
+        fpath.unlink(missing_ok=True)
+        # Rebuild the in-memory BM25 index without the deleted chunks
+        try:
+            chunks = retriever.pipeline.vector_store.get_all_chunks()
+            retriever.pipeline.build_bm25_index(chunks)
+        except Exception as exc:
+            print(f"[App] BM25 rebuild warning after delete: {exc}")
+        st.success(f"Deleted '{fpath.name}' and its indexed chunks.")
+        st.rerun()
+    except Exception as exc:
+        st.error(f"Delete failed: {exc}")
+
+
+def _delete_company(company: str) -> None:
+    """Delete a company: all its files on disk and every indexed chunk (memory + Firestore)."""
+    try:
+        retriever = get_retriever()
+        retriever.pipeline.vector_store.delete_company_chunks(company)
+        company_dir = ROOT / "data" / company
+        if company_dir.exists() and company_dir.is_dir():
+            for fpath in company_dir.rglob("*"):
+                if fpath.is_file():
+                    fpath.unlink(missing_ok=True)
+            for sub in sorted(company_dir.rglob("*"), key=lambda p: len(p.parts), reverse=True):
+                if sub.is_dir():
+                    try:
+                        sub.rmdir()
+                    except OSError:
+                        pass
+            try:
+                company_dir.rmdir()
+            except OSError:
+                pass
+        try:
+            chunks = retriever.pipeline.vector_store.get_all_chunks()
+            retriever.pipeline.build_bm25_index(chunks)
+        except Exception as exc:
+            print(f"[App] BM25 rebuild warning after company delete: {exc}")
+        st.success(f"Deleted company '{company}' and all its files and indexed chunks.")
+    except Exception as exc:
+        st.error(f"Delete company failed: {exc}")
+
+
+with tab_docs:
+    st.markdown("### 📁 Document Library")
+    data_path = ROOT / "data"
+    if data_path.exists():
+        companies = sorted([d.name for d in data_path.iterdir() if d.is_dir()])
+
+        # ── Create a new company folder ──
+        with st.expander("➕ Create New Company Folder", expanded=False):
+            nc_col1, nc_col2 = st.columns([3, 1])
+            with nc_col1:
+                new_company = st.text_input(
+                    "Company name", key="new_company_input", label_visibility="collapsed",
+                    placeholder="e.g., Acme Corp",
                 )
-                lexical_results  = search_response["lexical"]
-                semantic_results = search_response["semantic"]
-                reranked_results = search_response["reranked"]
-                generation       = search_response.get("generation", {})
+            with nc_col2:
+                if st.button("Create", key="create_company_btn", use_container_width=True):
+                    name = new_company.strip()
+                    if not name:
+                        st.error("Enter a company name first.")
+                    elif not re.fullmatch(r"[A-Za-z0-9 _\-]+", name):
+                        st.error("Company name may only contain letters, numbers, spaces, hyphens, and underscores.")
+                    elif (data_path / name).exists():
+                        st.error(f"Company '{name}' already exists.")
+                    else:
+                        (data_path / name).mkdir(parents=True, exist_ok=True)
+                        st.success(
+                            f"Company folder '{name}' created. Select it in the sidebar "
+                            "Tenant Scope and upload documents to tag them under this company."
+                        )
+                        st.rerun()
 
-            if search_response.get("error"):
-                st.error(search_response["error"])
-
-            render_single_view_results(
-                reranked_results=reranked_results,
-                lexical_results=lexical_results,
-                semantic_results=semantic_results,
-                generation=generation,
+        # ── Delete a company (removes all its files + indexed chunks) ──
+        with st.expander("🗑️ Delete Company", expanded=False):
+            del_target = st.selectbox(
+                "Company to delete", ["— Select —"] + companies, key="del_company_select"
             )
+            if del_target != "— Select —" and st.button(
+                "Delete Company", key="del_company_btn", use_container_width=True
+            ):
+                st.session_state.confirm_del_company = del_target
+                st.rerun()
+            if st.session_state.get("confirm_del_company") in companies:
+                target = st.session_state.confirm_del_company
+                st.warning(
+                    f"⚠️ Delete company '{target}' and ALL of its files and indexed "
+                    "chunks? This cannot be undone."
+                )
+                cf_col1, cf_col2 = st.columns(2)
+                with cf_col1:
+                    if st.button("Yes, delete", key="confirm_del_company_yes", use_container_width=True):
+                        _delete_company(target)
+                        st.session_state.confirm_del_company = None
+                        st.rerun()
+                with cf_col2:
+                    if st.button("Cancel", key="confirm_del_company_no", use_container_width=True):
+                        st.session_state.confirm_del_company = None
+                        st.rerun()
 
-            # Save response to history
-            st.session_state.messages.append({
-                "role": "assistant",
-                "content": "",
-                "lexical_results":  lexical_results,
-                "semantic_results": semantic_results,
-                "reranked_results": reranked_results,
-                "generation":       generation,
-                "error": search_response.get("error"),
-            })
+        # ── Company filter (defaults to the sidebar tenant selection) ──
+        company_options = ["All Companies"] + companies
+        default_idx = company_options.index(selected_company) if selected_company in company_options else 0
+        filter_company = st.selectbox(
+            "🏢 Company", company_options, index=default_idx, key="docs_company_filter"
+        )
+
+        # ── File-name search ──
+        search_term = st.text_input(
+            "🔎 Find file", key="docs_search", label_visibility="collapsed",
+            placeholder="Search files by name...",
+        ).strip().lower()
+
+        all_files = (
+            list(data_path.glob("**/*.pdf")) +
+            list(data_path.glob("**/*.txt")) +
+            list(data_path.glob("**/*.docx"))
+        )
+        all_files = [f for f in all_files if not f.name.startswith(("~$", ".", "__"))]
+        total_files = len(all_files)
+
+        if filter_company != "All Companies":
+            all_files = [
+                f for f in all_files
+                if (f.relative_to(data_path).parts[0] if len(f.relative_to(data_path).parts) > 1 else "General") == filter_company
+            ]
+        if search_term:
+            all_files = [f for f in all_files if search_term in f.name.lower()]
+
+        if total_files == 0:
+            st.markdown("""
+<div style="text-align:center;padding:3rem;color:#64748b;">
+    <div style="font-size:3rem;margin-bottom:1rem;">📂</div>
+    <div style="font-weight:600;color:#94a3b8;">No documents in data/</div>
+    <div style="font-size:0.85rem;margin-top:0.5rem;">
+        Upload via the sidebar or place HR policy files in the data/ folder.
+    </div>
+</div>""", unsafe_allow_html=True)
+        elif not all_files:
+            st.info("No files match the current filters. Adjust the company or search term.")
+        else:
+            # Group files by company so the library reads as company categories
+            by_company: Dict[str, List[Path]] = {}
+            for fpath in all_files:
+                rel = fpath.relative_to(data_path)
+                company = rel.parts[0] if len(rel.parts) > 1 else "General"
+                by_company.setdefault(company, []).append(fpath)
+
+            ext_icons = {"pdf": "📄", "txt": "📝", "docx": "📋"}
+            for company in sorted(by_company):
+                st.markdown(f"### 🏢 {company}")
+                cols = st.columns(3)
+                for i, fpath in enumerate(by_company[company]):
+                    with cols[i % 3]:
+                        rel      = fpath.relative_to(data_path)
+                        parts    = rel.parts
+                        subfolder = "/".join(parts[1:-1]) if len(parts) > 2 else "General"
+                        size_kb  = fpath.stat().st_size // 1024
+                        icon     = ext_icons.get(fpath.suffix.lstrip("."), "📁")
+                        st.markdown(f"""
+<div class="citation-card">
+    <div style="font-size:1.3rem;">{icon}</div>
+    <div style="font-weight:600;font-size:0.85rem;margin-top:4px;">{fpath.name}</div>
+    <div style="font-size:0.75rem;color:#94a3b8;">{subfolder}</div>
+    <div style="font-size:0.72rem;color:#64748b;">{size_kb} KB</div>
+</div>""", unsafe_allow_html=True)
+                        if st.button("🗑️ Delete", key=f"del_{rel}", use_container_width=True):
+                            _delete_document(fpath)
+    else:
+        st.info("data/ directory not found. Create it and add HR policy documents.")
+
+
+# ── Floating Chat Input (Bottom Panel) ────────────────────────────────────────
+with st.bottom:
+    st.markdown("""
+    <style>
+    .floating-chat-panel {
+        background: linear-gradient(135deg, #0f1629 0%, #1a2545 100%);
+        border-top: 1px solid var(--border);
+        padding: 0.5rem 0;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+    
+    user_query = st.chat_input(
+        "Ask a policy question... (Enter to send, Shift+Enter for new line)",
+        key="floating_chat_input",
+    )
+    
+    if user_query:
+        with st.spinner("Searching policy documents..."):
+            try:
+                retriever = get_retriever()
+                company_arg = None if selected_company == "All Companies" else selected_company
+                result = retriever.search(
+                    query=user_query,
+                    top_k=top_k,
+                    company=company_arg,
+                    rerank_top_n=rerank_top_n,
+                    rag_mode=rag_mode,
+                    hf_model=selected_model,
+                    use_local_engine=use_local,
+                )
+                st.session_state.last_result = result
+                st.session_state.chat_history.append({"query": user_query, "result": result})
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Search error: {exc}")
