@@ -24,6 +24,9 @@ FlagEmbedding>=1.2.10
 # ── Lexical Search ──────────────────────────────────────────────────────────
 rank-bm25>=0.2.2
 
+# ── Vector Search (FAISS for fast in-memory similarity search) ──────────────
+faiss-cpu>=1.7.4
+
 # ── Numerics ────────────────────────────────────────────────────────────────
 numpy>=1.26.0
 

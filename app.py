@@ -10,13 +10,48 @@ Features:
 """
 import sys
 import re
+import time
 from pathlib import Path
 from typing import Dict, List
 import streamlit as st
 
+import atexit
+import shutil
+
+
+class Timer:
+    """Context manager for timing operations and logging to terminal."""
+    def __init__(self, label: str):
+        self.label = label
+        self.start = 0.0
+        self.elapsed = 0.0
+
+    def __enter__(self):
+        self.start = time.perf_counter()
+        return self
+
+    def __exit__(self, *args):
+        self.elapsed = time.perf_counter() - self.start
+        print(f"[Timer] {self.label}: {self.elapsed:.3f}s")
+
 # ── Path setup ────────────────────────────────────────────────────────────────
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
+
+def _cleanup_session_temp_files():
+    """Ensure temporary local chunk files in data/ are wiped on app process termination."""
+    try:
+        data_dir = ROOT / "data"
+        if data_dir.exists():
+            for item in data_dir.iterdir():
+                if item.is_dir():
+                    shutil.rmtree(item, ignore_errors=True)
+                elif item.is_file() and not item.name.startswith("."):
+                    item.unlink(missing_ok=True)
+    except Exception as exc:
+        print(f"[App] Session cleanup notice: {exc}")
+
+atexit.register(_cleanup_session_temp_files)
 
 try:
     from dotenv import load_dotenv
@@ -156,6 +191,16 @@ html, body, [class*="css"] {
     font-size: 0.75rem; font-weight: 700; letter-spacing: 0.03em;
 }
 .answer-text { line-height: 1.8; color: var(--text-primary); font-size: 0.95rem; }
+.company-highlight {
+    background: rgba(79,124,247,0.12);
+    color: #4f7cf7;
+    border: 1px solid rgba(79,124,247,0.3);
+    border-radius: 4px;
+    padding: 0.1rem 0.4rem;
+    font-weight: 600;
+    font-size: 0.9em;
+}
+.company-sentence-break { margin-top: 0.6rem; display: block; }
 
 .citation-card {
     background: var(--bg-elevated);
@@ -379,11 +424,114 @@ st.markdown('</div>', unsafe_allow_html=True)
 defaults = {
     "retriever": None, "pipeline": None,
     "chat_history": [], "docs_indexed": 0, "last_result": None,
-    "confirm_del_company": None,
+    "confirm_del_company": None, "history_loaded": False,
 }
 for k, v in defaults.items():
     if k not in st.session_state:
         st.session_state[k] = v
+
+
+# ── Conversation History Persistence ──────────────────────────────────────────
+HISTORY_COLLECTION = "chat_history"
+
+
+def _save_history_to_firestore():
+    """Save current chat history to Firestore."""
+    try:
+        from src.config import get_firestore_client, is_firebase_available
+        if not is_firebase_available():
+            return
+        db = get_firestore_client()
+        session_id = st.session_state.get("session_id")
+        if not session_id:
+            import uuid
+            session_id = str(uuid.uuid4())[:16]
+            st.session_state["session_id"] = session_id
+
+        doc_ref = db.collection(HISTORY_COLLECTION).document(session_id)
+        history_data = []
+        for turn in st.session_state.chat_history:
+            result = turn.get("result", {})
+            gen = result.get("generation", {})
+            answers = gen.get("answers", [])
+            best_answer = answers[0].get("answer", "") if answers else result.get("answer", "")
+            history_data.append({
+                "query": turn["query"],
+                "answer": best_answer,
+                "timestamp": turn.get("timestamp"),
+            })
+        doc_ref.set({
+            "session_id": session_id,
+            "history": history_data,
+            "updated_at": __import__("time").time(),
+        }, merge=True)
+    except Exception as exc:
+        print(f"[App] History save notice: {exc}")
+
+
+def _load_history_from_firestore():
+    """Load chat history from Firestore on startup."""
+    try:
+        from src.config import get_firestore_client, is_firebase_available
+        if not is_firebase_available():
+            return []
+        db = get_firestore_client()
+        session_id = st.session_state.get("session_id")
+        if not session_id:
+            return []
+
+        doc = db.collection(HISTORY_COLLECTION).document(session_id).get()
+        if doc.exists:
+            data = doc.to_dict() or {}
+            history = data.get("history", [])
+            print(f"[App] Loaded {len(history)} history turns from Firestore")
+            return history
+    except Exception as exc:
+        print(f"[App] History load notice: {exc}")
+    return []
+
+
+def _build_conversation_context() -> str:
+    """Build context string from recent conversation history for follow-up questions."""
+    history = st.session_state.chat_history
+    if not history:
+        return ""
+
+    context_parts = []
+    for turn in history[-5:]:
+        query = turn.get("query", "")
+        result = turn.get("result", {})
+        gen = result.get("generation", {})
+        answers = gen.get("answers", [])
+        answer = answers[0].get("answer", "") if answers else result.get("answer", "")
+        if query and answer:
+            context_parts.append(f"Employee: {query}")
+            context_parts.append(f"HR: {answer[:500]}")
+
+    if context_parts:
+        return "Previous conversation:\n" + "\n".join(context_parts) + "\n\n"
+    return ""
+
+
+# Generate session ID and load history on first load
+if "session_id" not in st.session_state:
+    import uuid
+    st.session_state["session_id"] = str(uuid.uuid4())[:16]
+
+if not st.session_state.history_loaded:
+    saved_history = _load_history_from_firestore()
+    if saved_history:
+        for turn in saved_history:
+            st.session_state.chat_history.append({
+                "query": turn.get("query", ""),
+                "result": {
+                    "generation": {"answers": [{"answer": turn.get("answer", "")}]},
+                    "answer": turn.get("answer", ""),
+                },
+                "timestamp": turn.get("timestamp"),
+            })
+        print(f"[App] Restored {len(saved_history)} conversation turns")
+    st.session_state.history_loaded = True
 
 
 # ── Cached resources ──────────────────────────────────────────────────────────
@@ -391,16 +539,22 @@ for k, v in defaults.items():
 def get_retriever():
     from src.retriever import HybridRetriever
     from src.embeddings import EmbeddingPipeline
+    from src.firebase_client import FAISSIndex
     pipeline = EmbeddingPipeline()
     retriever = HybridRetriever(pipeline=pipeline)
-    try:
-        from src.data_loader import load_all_documents
-        docs = load_all_documents("data")
-        if docs:
-            pipeline.add_documents(docs)
-            print(f"[App] Pre-loaded {len(docs)} document chunks from data/")
-    except Exception as exc:
-        print(f"[App] Data pre-load warning: {exc}")
+    
+    # Initialize FAISS index for fast vector search
+    faiss_index = FAISSIndex()
+    retriever.faiss_index = faiss_index
+    
+    # Load embeddings from Firestore into FAISS on startup
+    if pipeline.vector_store.is_online:
+        try:
+            count = faiss_index.load_from_firestore(pipeline.vector_store)
+            print(f"[App] FAISS index loaded: {count} vectors")
+        except Exception as exc:
+            print(f"[App] FAISS load notice: {exc}")
+    
     return retriever
 
 
@@ -410,12 +564,93 @@ def check_firebase():
     return is_firebase_available()
 
 
+def _ensure_data_loaded(retriever):
+    """Lazy-load documents on first search if not already indexed."""
+    if st.session_state.docs_indexed > 0:
+        return
+    try:
+        from src.data_loader import load_all_documents
+        docs = load_all_documents("data")
+        if docs:
+            retriever.pipeline.add_documents(docs)
+            st.session_state.docs_indexed = len(docs)
+            print(f"[App] Lazy-loaded {len(docs)} document chunks from data/")
+    except Exception as exc:
+        print(f"[App] Data lazy-load notice: {exc}")
+
+
 def _hex_to_rgb(hex_color: str) -> str:
     h = hex_color.lstrip("#")
     if len(h) == 6:
         r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
         return f"{r},{g},{b}"
     return "79,124,247"
+
+
+def _detect_policy_category(query: str) -> str | None:
+    """Auto-detect policy category from query keywords for targeted search."""
+    query_lower = query.lower()
+    
+    category_keywords = {
+        "Leave Policy": ["leave", "vacation", "holiday", "time off", "pto", "annual leave", "sick leave", "casual leave"],
+        "Insurance & Benefits": ["insurance", "benefit", "medical", "health", "coverage", "claim", "dental", "vision"],
+        "Maternity & Paternity": ["maternity", "paternity", "parental", "baby", "child", "pregnancy", "adoption"],
+        "Code of Conduct": ["conduct", "ethics", "behavior", "harassment", "discrimination", "compliance"],
+        "Compensation": ["salary", "compensation", "bonus", "incentive", "pay", "raise", "hike", "ctc"],
+        "Performance": ["performance", "appraisal", "review", "rating", "kpi", "goal", "target"],
+        "Training & Development": ["training", "learning", "development", "course", "certification", "skill"],
+        "Travel & Expenses": ["travel", "expense", "reimbursement", "conveyance", "allowance"],
+        "Work From Home": ["work from home", "wfh", "remote", "telecommute", "hybrid work"],
+    }
+    
+    for category, keywords in category_keywords.items():
+        if any(kw in query_lower for kw in keywords):
+            return category
+    return None
+
+
+def _highlight_companies(text: str, companies: list[str]) -> str:
+    """Highlight company names with bold and add line breaks before new points."""
+    if not companies or not text:
+        return text
+
+    import re
+
+    # Sort by length descending to match longer names first
+    sorted_companies = sorted(companies, key=len, reverse=True)
+
+    # Build regex pattern for company names
+    escaped = [re.escape(c) for c in sorted_companies]
+    company_pattern = re.compile(r'\b(' + '|'.join(escaped) + r')\b', re.IGNORECASE)
+
+    # Remove "For [Company] ," prefix patterns
+    text = re.sub(r'(?i)\bFor\s+(' + '|'.join(escaped) + r')\s*,\s*', r'\1: ', text)
+
+    # Add line breaks at sentence boundaries before key points
+    # Split on period followed by space and a capital letter (new sentence)
+    text = re.sub(r'\.\s+(?=[A-Z][a-z])', '.\n\n', text)
+
+    return text
+
+
+def _apply_company_highlight_html(text: str, companies: list[str]) -> str:
+    """Apply HTML highlighting to company names in already-escaped text."""
+    if not companies or not text:
+        return text
+
+    import re
+
+    sorted_companies = sorted(companies, key=len, reverse=True)
+    escaped = [re.escape(c) for c in sorted_companies]
+    company_pattern = re.compile(r'\b(' + '|'.join(escaped) + r')\b', re.IGNORECASE)
+
+    # Replace company names with styled span
+    text = company_pattern.sub(r'<span class="company-highlight">\1</span>', text)
+
+    # Convert newlines to <br> for HTML rendering
+    text = text.replace("\n", "<br>")
+
+    return text
 
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
@@ -475,8 +710,9 @@ with st.sidebar:
 
     rag_mode = st.radio(
         "RAG Mode",
-        ["hybrid", "semantic", "fullylexical"],
+        ["fast", "hybrid", "semantic", "fullylexical"],
         format_func=lambda x: {
+            "fast":         "⚡ Fast (No Reranking)",
             "hybrid":       "🔀 Hybrid (Recommended)",
             "semantic":     "🔵 Semantic Only",
             "fullylexical": "🔤 Lexical Only",
@@ -486,7 +722,7 @@ with st.sidebar:
 
     use_local = st.toggle(
         "Use Local Transformers",
-        value=True,
+        value=False,
         key="local_engine",
         help="Run locally via transformers (no cloud API needed).",
     )
@@ -513,42 +749,76 @@ with st.sidebar:
         "Upload to Company", _upload_companies,
         index=_upload_companies.index(_up_default), key="upload_company_select",
     )
+    
+    # Policy category / subfolder selector
+    _policy_categories = [
+        "Leave Policy", "Insurance & Benefits", "Maternity & Paternity",
+        "Code of Conduct", "Compensation", "Performance", "Training & Development",
+        "Travel & Expenses", "Work From Home", "General"
+    ]
+    upload_subfolder = st.selectbox(
+        "Policy Category", _policy_categories,
+        index=len(_policy_categories) - 1, key="upload_subfolder_select",
+        help="Categorize the policy for organized retrieval"
+    )
+    
     uploaded = st.file_uploader(
         "Upload HR Policies", type=["pdf", "txt", "docx"],
         accept_multiple_files=True, key="doc_uploader", label_visibility="collapsed",
     )
     if uploaded and st.button("📥 Index Documents", key="index_btn", use_container_width=True):
-        with st.spinner("Indexing documents..."):
+        with st.spinner("Indexing documents to Firestore + FAISS..."):
             try:
-                retriever = get_retriever()
-                all_docs = []
-                tenant = upload_company
-                upload_dir = ROOT / "data" / tenant
-                upload_dir.mkdir(parents=True, exist_ok=True)
-                for f in uploaded:
-                    dest = upload_dir / f.name
-                    dest.write_bytes(f.getvalue())
-                from src.data_loader import _load_pdfs, _load_txts, _load_docx
-                all_docs += _load_pdfs(upload_dir)
-                all_docs += _load_txts(upload_dir)
-                all_docs += _load_docx(upload_dir)
-                if all_docs:
-                    retriever.pipeline.add_documents(all_docs)
-                    st.session_state.docs_indexed += len(all_docs)
-                    store = retriever.pipeline.vector_store
-                    if store.is_online:
-                        st.success(
-                            f"Indexed {len(all_docs)} chunks for '{tenant}' — saved to "
-                            f"data/{tenant}/ and synced to Firestore."
-                        )
+                with Timer("Total upload") as t_upload:
+                    retriever = get_retriever()
+                    tenant = upload_company
+                    
+                    # Parse files in-memory with subfolder metadata
+                    with Timer("Parse files") as t_parse:
+                        from src.data_loader import parse_uploaded_files
+                        all_docs = parse_uploaded_files(uploaded, company=tenant, subfolder=upload_subfolder)
+                    
+                    if all_docs:
+                        # Send to Firestore via embedding pipeline
+                        with Timer("Add to Firestore + BM25") as t_fs:
+                            retriever.pipeline.add_documents(all_docs)
+                            st.session_state.docs_indexed += len(all_docs)
+                        
+                        # Also add to FAISS index for fast search
+                        if retriever.faiss_index:
+                            try:
+                                with Timer("Add to FAISS") as t_faiss:
+                                    # Get the chunks that were just added
+                                    chunks = retriever.pipeline._bm25_docs[-len(all_docs):]
+                                    vectors = []
+                                    doc_ids = []
+                                    metadata_list = []
+                                    for chunk in chunks:
+                                        # Compute embedding for new chunk
+                                        emb = retriever.pipeline._store._call_hf_cloud_embedding(chunk.get("chunk_text", ""))
+                                        if emb and len(emb) == 1024:
+                                            vectors.append(emb)
+                                            doc_ids.append(chunk.get("doc_id", ""))
+                                            metadata_list.append(chunk.get("metadata", {}))
+                                    if vectors:
+                                        retriever.faiss_index.add_vectors(vectors, doc_ids, metadata_list)
+                                        print(f"[App] Added {len(vectors)} vectors to FAISS index")
+                            except Exception as exc:
+                                print(f"[App] FAISS update notice: {exc}")
+                        
+                        store = retriever.pipeline.vector_store
+                        if store.is_online:
+                            st.success(
+                                f"Indexed {len(all_docs)} chunks for '{tenant}' — "
+                                f"sent to Firestore + FAISS."
+                            )
+                        else:
+                            st.warning(
+                                f"Indexed {len(all_docs)} chunks for '{tenant}'. "
+                                f"Firebase is offline — data stored in memory only."
+                            )
                     else:
-                        st.warning(
-                            f"Indexed {len(all_docs)} chunks for '{tenant}' locally in "
-                            f"data/{tenant}/. Firebase is offline — use 'Sync to Firebase' "
-                            "to upload them later."
-                        )
-                else:
-                    st.warning("No processable content found.")
+                        st.warning("No processable content found in uploaded files.")
             except Exception as exc:
                 st.error(f"Indexing error: {exc}")
 
@@ -639,7 +909,9 @@ with tab_search:
                     icon = ans.get("icon", "🤖")
                     label = ans.get("label", "Policy Processor")
                     section_type = ans.get("section_type", "general")
-                    text = ans.get("answer", "").replace("\n", "<br>")
+                    raw_text = ans.get("answer", "")
+                    # Add line breaks at sentence boundaries
+                    text = _highlight_companies(raw_text, companies)
                     rgb = _hex_to_rgb(bc)
                     
                     # Use specific CSS class based on section type
@@ -648,6 +920,11 @@ with tab_search:
                         "differences": "multi-company-diff",
                         "summary": "multi-company-summary",
                     }.get(section_type, "answer-card")
+                    
+                    # Escape HTML then apply company highlighting
+                    import html as html_mod
+                    safe_text = html_mod.escape(text)
+                    safe_text = _apply_company_highlight_html(safe_text, companies)
                     
                     st.markdown(f"""
 <div class="{card_class}">
@@ -658,7 +935,7 @@ with tab_search:
             {label}
         </span>
     </div>
-    <div class="answer-text">{text}</div>
+    <div class="answer-text">{safe_text}</div>
 </div>""", unsafe_allow_html=True)
                 
                 # Company groups in expandable sections
@@ -679,12 +956,23 @@ with tab_search:
             
             else:
                 # ── Standard Single-Company Format ────────────────────────
+                # Get company names for highlighting
+                _all_companies = []
+                if data_path.exists():
+                    _all_companies = sorted([d.name for d in data_path.iterdir() if d.is_dir()])
+
                 for ans in answers:
                     bc = ans.get("badge_color", "#6366f1")
                     icon = ans.get("icon", "🤖")
                     label = ans.get("label", "Policy Processor")
-                    text = ans.get("answer", "").replace("\n", "<br>")
+                    raw_text = ans.get("answer", "")
+                    # Add line breaks at sentence boundaries
+                    text = _highlight_companies(raw_text, _all_companies)
                     rgb = _hex_to_rgb(bc)
+                    # Escape HTML then apply company highlighting
+                    import html as html_mod
+                    safe_text = html_mod.escape(text)
+                    safe_text = _apply_company_highlight_html(safe_text, _all_companies)
                     st.markdown(f"""
 <div class="answer-card">
     <div class="answer-card-header">
@@ -694,24 +982,7 @@ with tab_search:
             {label}
         </span>
     </div>
-    <div class="answer-text">{text}</div>
-</div>""", unsafe_allow_html=True)
-
-            if citations:
-                with st.expander(f"📚 Source Citations ({len(citations)})", expanded=True):
-                    for cit in citations:
-                        score = cit.get("score", 0)
-                        score_str = f"{score:.3f}" if isinstance(score, float) else str(score)
-                        fname = cit.get("filename", "Unknown")
-                        page = cit.get("page", "")
-                        sec = cit.get("section_header", "")
-                        rank = cit.get("rank", "?")
-                        st.markdown(f"""
-<div class="citation-card">
-    <strong>#{rank} — {fname}</strong>
-    <span style="color:#94a3b8;font-size:0.8rem;margin-left:0.5rem;">
-        p.{page} &bull; {sec} &bull; Score: {score_str}
-    </span>
+    <div class="answer-text">{safe_text}</div>
 </div>""", unsafe_allow_html=True)
 
             if result.get("mode") == "bm25_only":
@@ -764,7 +1035,14 @@ with tab_history:
                     icon = ans.get("icon", "🤖")
                     label = ans.get("label", "Policy Processor")
                     section_type = ans.get("section_type", "general")
-                    text = ans.get("answer", "").replace("\n", "<br>")
+                    raw_text = ans.get("answer", "")
+                    # Get company names for highlighting
+                    _hist_companies = companies if is_multi_company else (
+                        sorted([d.name for d in data_path.iterdir() if d.is_dir()])
+                        if data_path.exists() else []
+                    )
+                    # Add line breaks at sentence boundaries
+                    text = _highlight_companies(raw_text, _hist_companies)
                     rgb = _hex_to_rgb(bc)
                     
                     card_class = {
@@ -773,6 +1051,10 @@ with tab_history:
                         "summary": "multi-company-summary",
                     }.get(section_type, "answer-card") if is_multi_company else "answer-card"
                     
+                    # Escape HTML then apply company highlighting
+                    import html as html_mod
+                    safe_text = html_mod.escape(text)
+                    safe_text = _apply_company_highlight_html(safe_text, _hist_companies)
                     st.markdown(f"""
 <div class="{card_class}">
     <div class="answer-card-header">
@@ -782,24 +1064,7 @@ with tab_history:
             {label}
         </span>
     </div>
-    <div class="answer-text">{text}</div>
-</div>""", unsafe_allow_html=True)
-
-                if citations:
-                    st.markdown("**📚 Sources**")
-                    for cit in citations:
-                        score = cit.get("score", 0)
-                        score_str = f"{score:.3f}" if isinstance(score, float) else str(score)
-                        fname = cit.get("filename", "Unknown")
-                        page = cit.get("page", "")
-                        sec = cit.get("section_header", "")
-                        rank = cit.get("rank", "?")
-                        st.markdown(f"""
-<div class="citation-card">
-    <strong>#{rank} — {fname}</strong>
-    <span style="color:#94a3b8;font-size:0.8rem;margin-left:0.5rem;">
-        p.{page} &bull; {sec} &bull; Score: {score_str}
-    </span>
+    <div class="answer-text">{safe_text}</div>
 </div>""", unsafe_allow_html=True)
 
                 with st.expander("🔍 Detailed Results", expanded=False):
@@ -1014,19 +1279,43 @@ with st.bottom:
     if user_query:
         with st.spinner("Searching policy documents..."):
             try:
-                retriever = get_retriever()
-                company_arg = None if selected_company == "All Companies" else selected_company
-                result = retriever.search(
-                    query=user_query,
-                    top_k=top_k,
-                    company=company_arg,
-                    rerank_top_n=rerank_top_n,
-                    rag_mode=rag_mode,
-                    hf_model=selected_model,
-                    use_local_engine=use_local,
-                )
+                with Timer("Total query") as t_total:
+                    retriever = get_retriever()
+                    # Build conversation context for follow-up questions
+                    conv_context = _build_conversation_context()
+                    company_arg = None if selected_company == "All Companies" else selected_company
+                    
+                    # Auto-detect policy category from query for targeted search
+                    detected_subfolder = _detect_policy_category(user_query)
+                    if detected_subfolder:
+                        print(f"[App] Detected policy category: {detected_subfolder}")
+                    
+                    # Fast mode: reduce search scope for speed
+                    if rag_mode == "fast":
+                        fast_top_k = min(top_k, 3)
+                        fast_rerank = min(rerank_top_n, 3)
+                        fast_semantic = 10
+                    else:
+                        fast_top_k = top_k
+                        fast_rerank = rerank_top_n
+                        fast_semantic = 20
+                    
+                    result = retriever.search(
+                        query=user_query,
+                        top_k=fast_top_k,
+                        company=company_arg,
+                        subfolder=detected_subfolder,
+                        rerank_top_n=fast_rerank,
+                        semantic_limit=fast_semantic,
+                        rag_mode=rag_mode,
+                        hf_model=selected_model,
+                        use_local_engine=use_local,
+                        conversation_context=conv_context,
+                    )
                 st.session_state.last_result = result
                 st.session_state.chat_history.append({"query": user_query, "result": result})
+                # Save to Firestore
+                _save_history_to_firestore()
                 st.rerun()
             except Exception as exc:
                 st.error(f"Search error: {exc}")

@@ -1,4 +1,4 @@
-﻿"""
+"""
 retriever.py
 HybridRetriever — clean orchestration of the full LOVA HR search pipeline.
 
@@ -10,6 +10,7 @@ Steps:
   5. LLM Answer Generation (local Qwen2.5 / Cloud HF / Rule-based fallback)
 """
 from __future__ import annotations
+import time
 from typing import Any, Dict, List, Optional
 
 try:
@@ -52,6 +53,7 @@ class HybridRetriever:
         self.pipeline = pipeline or EmbeddingPipeline()
         self.generator = LLMGenerator()
         self._firebase_ok: Optional[bool] = None
+        self.faiss_index = None  # Set by app.py for fast vector search
 
     def _check_firebase(self) -> bool:
         if self._firebase_ok is None:
@@ -74,8 +76,9 @@ class HybridRetriever:
         lexical_limit: int = 20,
         max_providers: int = 1,
         rag_mode: str = "hybrid",
-        hf_model: str = "Qwen/Qwen2.5-1.5B-Instruct",
-        use_local_engine: bool = True,
+        hf_model: str = "Qwen/Qwen2.5-3B-Instruct",
+        use_local_engine: bool = False,
+        conversation_context: str = "",
     ) -> Dict[str, Any]:
         """
         Execute the full retrieval + answer generation pipeline.
@@ -101,6 +104,7 @@ class HybridRetriever:
         firebase_up = self._check_firebase()
 
         # Branch B: BM25 Lexical (always runs)
+        t0 = time.perf_counter()
         try:
             response["lexical"] = self.pipeline.lexical_search(
                 query=clean_query, top_k=lexical_limit,
@@ -109,22 +113,46 @@ class HybridRetriever:
         except Exception as exc:
             print(f"[HybridRetriever] BM25 error: {exc}")
             response["lexical"] = []
+        print(f"[Timer] BM25 search: {time.perf_counter() - t0:.3f}s")
 
         # Branch A: Firebase Semantic + RRF + Rerank
         if firebase_up:
             try:
-                response["semantic"] = self.pipeline.semantic_search(
-                    query=clean_query, top_k=semantic_limit,
-                    company=company, subfolder=subfolder,
-                )
-                fused = self.pipeline.hybrid_search(
-                    query=clean_query,
-                    semantic_limit=semantic_limit, lexical_limit=lexical_limit,
-                    fusion_top_k=20, company=company, subfolder=subfolder,
-                )
-                response["reranked"] = self.pipeline.rerank(
-                    query=clean_query, candidates=fused, top_n=rerank_top_n,
-                )
+                # Use FAISS for fast semantic search if available
+                t1 = time.perf_counter()
+                if self.faiss_index and self.faiss_index.is_loaded:
+                    # Compute query embedding
+                    query_emb = self.pipeline._store._compute_query_embedding(clean_query)
+                    response["semantic"] = self.faiss_index.search(
+                        query_vector=query_emb, top_k=semantic_limit,
+                        company=company, subfolder=subfolder
+                    )
+                    print(f"[HybridRetriever] FAISS semantic search: {len(response['semantic'])} results")
+                else:
+                    response["semantic"] = self.pipeline.semantic_search(
+                        query=clean_query, top_k=semantic_limit,
+                        company=company, subfolder=subfolder,
+                    )
+                print(f"[Timer] Semantic search: {time.perf_counter() - t1:.3f}s")
+                
+                # Fuse lexical + semantic
+                t2 = time.perf_counter()
+                lex_results = response["lexical"]
+                sem_results = response["semantic"]
+                from .embeddings import _reciprocal_rank_fusion
+                fused = _reciprocal_rank_fusion([lex_results, sem_results])[:20]
+                print(f"[Timer] RRF fusion: {time.perf_counter() - t2:.3f}s")
+                
+                # Skip reranking in fast mode for speed
+                t3 = time.perf_counter()
+                if rag_mode == "fast":
+                    response["reranked"] = fused[:rerank_top_n]
+                    print("[HybridRetriever] Fast mode: skipped reranking")
+                else:
+                    response["reranked"] = self.pipeline.rerank(
+                        query=clean_query, candidates=fused, top_n=rerank_top_n,
+                    )
+                print(f"[Timer] Rerank: {time.perf_counter() - t3:.3f}s")
             except Exception as exc:
                 print(f"[HybridRetriever] Firebase retrieval error: {exc}")
                 response["error"] = f"Firebase retrieval error: {exc}"
@@ -152,6 +180,7 @@ class HybridRetriever:
             target_chunks = response["reranked"] or response["lexical"]
 
         # LLM Answer Generation
+        t4 = time.perf_counter()
         response["generation"] = self.generator.generate_answer(
             query=clean_query,
             chunks=target_chunks,
@@ -162,6 +191,8 @@ class HybridRetriever:
             semantic_chunks=response["semantic"],
             lexical_chunks=response["lexical"],
             use_local_engine=use_local_engine,
+            conversation_context=conversation_context,
         )
+        print(f"[Timer] LLM generation: {time.perf_counter() - t4:.3f}s")
 
         return response

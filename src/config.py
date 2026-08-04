@@ -18,8 +18,10 @@ import os
 from pathlib import Path
 from typing import Optional
 
-import firebase_admin
-from firebase_admin import credentials, firestore
+# Lazy-import firebase_admin so import time stays fast
+firebase_admin = None  # type: ignore
+credentials = None  # type: ignore
+_firestore_module = None  # type: ignore
 
 repo_root = Path(__file__).resolve().parent.parent
 env_path = repo_root / ".env"
@@ -33,6 +35,11 @@ except ImportError:
     pass
 
 # ── Constants ────────────────────────────────────────────────────────────────
+
+# Cloud-only mode: when True, never download or load any model weights locally.
+# All inference (embeddings, LLM generation, reranking) goes through cloud APIs.
+# Requires HF_TOKEN with "Inference Providers" scope.
+CLOUD_ONLY_MODE: bool = os.getenv("CLOUD_ONLY_MODE", "false").lower() in ("true", "1", "yes")
 
 # Firebase Project ID
 FIREBASE_PROJECT_ID: str = os.getenv("FIREBASE_PROJECT_ID", "lova-hr")
@@ -71,16 +78,24 @@ _firestore_client = None
 
 # ── Initialization ────────────────────────────────────────────────────────────
 
-def init_firebase() -> firebase_admin.App:
+def init_firebase():
     """
     Initialize the Firebase Admin SDK and return the App instance.
     Idempotent — safe to call multiple times.
     """
-    global _firebase_app
+    global _firebase_app, firebase_admin, credentials, _firestore_module
 
     # Already initialized
     if _firebase_app is not None:
         return _firebase_app
+
+    # Lazy-import on first use
+    if firebase_admin is None:
+        import firebase_admin as _fb_admin
+        from firebase_admin import credentials as _creds, firestore as _fs
+        firebase_admin = _fb_admin
+        credentials = _creds
+        _firestore_module = _fs
 
     # Check if the named app already exists (e.g. from a previous Streamlit hot-reload)
     try:
@@ -172,7 +187,7 @@ def get_firestore_client():
 
     init_firebase()
     # Pass the named app so we always use the correct project
-    _firestore_client = firestore.client(app=firebase_admin.get_app(_APP_NAME))
+    _firestore_client = _firestore_module.client(app=firebase_admin.get_app(_APP_NAME))
     return _firestore_client
 
 

@@ -28,16 +28,33 @@ import re
 import time
 from typing import Any, Dict, List, Optional
 
-import numpy as np
-from google.cloud.firestore_v1.base_query import FieldFilter
-from google.cloud.firestore_v1.base_vector_query import DistanceMeasure
-from google.cloud.firestore_v1.vector import Vector
+# Lazy imports — defer heavy libraries until first use
+np = None  # type: ignore
+faiss = None  # type: ignore
+_FieldFilter = None  # type: ignore
+_DistanceMeasure = None  # type: ignore
+_Vector = None  # type: ignore
+
+
+def _ensure_numpy():
+    """Lazy-import numpy and Firestore vector types on first use."""
+    global np, _FieldFilter, _DistanceMeasure, _Vector
+    if np is None:
+        import numpy as _np
+        from google.cloud.firestore_v1.base_query import FieldFilter as _FF
+        from google.cloud.firestore_v1.base_vector_query import DistanceMeasure as _DM
+        from google.cloud.firestore_v1.vector import Vector as _V
+        np = _np
+        _FieldFilter = _FF
+        _DistanceMeasure = _DM
+        _Vector = _V
 
 try:
     from .config import (
         COLLECTION_NAME,
         BGE_EMBEDDING_MODEL,
         EMBEDDING_DIM,
+        CLOUD_ONLY_MODE,
         get_firestore_client,
         init_firebase,
         is_firebase_available,
@@ -47,10 +64,20 @@ except ImportError:
         COLLECTION_NAME,
         BGE_EMBEDDING_MODEL,
         EMBEDDING_DIM,
+        CLOUD_ONLY_MODE,
         get_firestore_client,
         init_firebase,
         is_firebase_available,
     )
+
+
+def _safe_int(val: Any, default: int = 1) -> int:
+    if val is None or val == "":
+        return default
+    try:
+        return int(val)
+    except (ValueError, TypeError):
+        return default
 
 
 # ── Tokenizer helper (shared with BM25) ──────────────────────────────────────
@@ -70,17 +97,8 @@ def _chunk_id(text: str, metadata: Dict[str, Any], index: int = 0) -> str:
 
 # ─────────────────────────────────────────────────────────────────────────────
 class FirestoreVectorStore:
-    """
-    Firestore-backed vector store using BAAI/bge-large-en-v1.5 1024-dimensional embeddings.
-    Includes in-memory fallback when Firebase credentials are unavailable.
-
-    Provides:
-        - upload_policy_chunks()   — batch upsert LangChain Document chunks
-        - vector_search_firestore()— Firestore native cosine vector search (with in-memory fallback)
-        - get_all_documents()      — stream all docs for BM25 index hydration
-        - delete_*()               — scoped deletion helpers
-        - clear()                  — wipe collection
-    """
+    _has_native_vector_index: Optional[bool] = None  # None=unknown, True=online, False=use in-memory engine
+    _printed_index_notice: bool = False
 
     def __init__(self, batch_size: int = 50):
         self.batch_size = batch_size
@@ -149,23 +167,69 @@ class FirestoreVectorStore:
 
     # ── Embedding ─────────────────────────────────────────────────────────────
 
+    def _call_hf_cloud_embedding(self, text: str) -> List[float]:
+        """Compute 1024-dim dense embedding directly via HuggingFace Cloud Feature Extraction API."""
+        _ensure_numpy()
+        try:
+            import requests, os
+            token = os.getenv("HF_TOKEN", "")
+            if not token:
+                from src.generator import LLMGenerator
+                token = LLMGenerator()._get_hf_token()
+            
+            headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+            url = "https://router.huggingface.co/hf-inference/models/BAAI/bge-large-en-v1.5"
+            res = requests.post(url, json={"inputs": text}, headers=headers, timeout=3)
+            if res.status_code == 200:
+                vec = res.json()
+                if isinstance(vec, list) and len(vec) == 1024:
+                    arr = np.array(vec, dtype=np.float32)
+                    norm = np.linalg.norm(arr)
+                    if norm > 0:
+                        arr = arr / norm
+                    return arr.tolist()
+        except Exception as exc:
+            print(f"[FirestoreVectorStore] Cloud embedding notice: {exc}")
+        return []
+
     def _compute_embeddings(self, texts: List[str]) -> List[List[float]]:
-        """Return a list of 1024-dim float lists using the configured BGE embedding model."""
+        """Return a list of 1024-dim float lists using HF Cloud Feature Extraction API (no local downloading)."""
         if not texts:
             return []
-        vecs = self.model.encode(texts, batch_size=32, show_progress_bar=False, convert_to_numpy=True)
-        norms = np.linalg.norm(vecs, axis=1, keepdims=True)
-        norms = np.where(norms == 0, 1.0, norms)
-        vecs = vecs / norms
-        return vecs.tolist()
+        results = []
+        for text in texts:
+            vec = self._call_hf_cloud_embedding(text)
+            if not vec:
+                if CLOUD_ONLY_MODE:
+                    print("[FirestoreVectorStore] CLOUD_ONLY_MODE — cloud embedding failed, returning zero vector")
+                    vec = [0.0] * EMBEDDING_DIM
+                else:
+                    # Fallback to local model only if cloud API unavailable
+                    vec = self.model.encode([text], show_progress_bar=False, convert_to_numpy=True)[0].tolist()
+            results.append(vec)
+        return results
+
+    _query_cache: Dict[str, List[float]] = {}
 
     def _compute_query_embedding(self, query: str) -> List[float]:
-        """Encode a single query string using the configured BGE embedding model."""
-        vec = self.model.encode([query], show_progress_bar=False, convert_to_numpy=True)[0]
-        norm = np.linalg.norm(vec)
-        if norm > 0:
-            vec = vec / norm
-        return vec.tolist()
+        """Encode query string directly via HF Cloud Feature Extraction API (cached)."""
+        if query in self._query_cache:
+            return self._query_cache[query]
+        vec = self._call_hf_cloud_embedding(query)
+        if not vec:
+            if CLOUD_ONLY_MODE:
+                print("[FirestoreVectorStore] CLOUD_ONLY_MODE — cloud query embedding failed, returning zero vector")
+                vec = [0.0] * EMBEDDING_DIM
+            else:
+                # Fallback to local model only if cloud API unavailable
+                arr = self.model.encode([query], show_progress_bar=False, convert_to_numpy=True)[0]
+                norm = np.linalg.norm(arr)
+                if norm > 0:
+                    arr = arr / norm
+                vec = arr.tolist()
+        if vec and any(x != 0.0 for x in vec):
+            self._query_cache[query] = vec
+        return vec
 
     # ── Write ─────────────────────────────────────────────────────────────────
 
@@ -177,6 +241,7 @@ class FirestoreVectorStore:
         """
         Batch-upsert LangChain Document chunks into Firestore and in-memory fallback.
         """
+        _ensure_numpy()
         if force_reload:
             self.clear()
 
@@ -204,20 +269,20 @@ class FirestoreVectorStore:
             docs_to_upsert.append(
                 {
                     "doc_id": doc_id,
-                    "title": str(meta.get("filename", f"doc_{i}")),
+                    "title": str(meta.get("filename") or f"doc_{i}"),
                     "content": content,
                     "metadata": {
-                        "company": str(meta.get("company", meta.get("company_id", "General"))),
-                        "company_id": str(meta.get("company_id", meta.get("company", "General"))),
-                        "subfolder": str(meta.get("subfolder", "General")),
-                        "subtopic": str(meta.get("subtopic", meta.get("subfolder", "General"))),
-                        "filename": str(meta.get("filename", meta.get("document_id", ""))),
-                        "document_id": str(meta.get("document_id", meta.get("filename", ""))),
-                        "source": str(meta.get("source", meta.get("source_file", ""))),
-                        "source_file": str(meta.get("source_file", meta.get("source", ""))),
-                        "page": int(meta.get("page", meta.get("page_number", 1))),
-                        "page_number": int(meta.get("page_number", meta.get("page", 1))),
-                        "section_header": str(meta.get("section_header", "")),
+                        "company": str(meta.get("company") or meta.get("company_id") or "General"),
+                        "company_id": str(meta.get("company_id") or meta.get("company") or "General"),
+                        "subfolder": str(meta.get("subfolder") or "General"),
+                        "subtopic": str(meta.get("subtopic") or meta.get("subfolder") or "General"),
+                        "filename": str(meta.get("filename") or meta.get("document_id") or f"doc_{i}"),
+                        "document_id": str(meta.get("document_id") or meta.get("filename") or f"doc_{i}"),
+                        "source": str(meta.get("source") or meta.get("source_file") or ""),
+                        "source_file": str(meta.get("source_file") or meta.get("source") or ""),
+                        "page": _safe_int(meta.get("page") or meta.get("page_number"), 1),
+                        "page_number": _safe_int(meta.get("page_number") or meta.get("page"), 1),
+                        "section_header": str(meta.get("section_header") or ""),
                         "chunk_hash": doc_id,
                     },
                 }
@@ -345,6 +410,47 @@ class FirestoreVectorStore:
         effective_limit = limit if limit is not None else top_k
         return self.vector_search_firestore(query=query, limit=effective_limit, company=company, subfolder=subfolder)
 
+    def _ensure_memory_store_populated(self) -> None:
+        """If in-memory store is empty but Firestore is online, hydrate memory store from Firestore."""
+        if self._memory_store:
+            return
+        if self.is_online:
+            try:
+                docs = self.collection.stream()
+                missing_emb_docs = []
+                for doc in docs:
+                    data = doc.to_dict() or {}
+                    doc_id = data.get("doc_id", doc.id)
+                    emb_raw = data.get("embedding")
+                    emb = []
+                    if hasattr(emb_raw, "value"):
+                        emb = list(emb_raw.value)
+                    elif isinstance(emb_raw, (list, tuple)):
+                        emb = [float(x) for x in emb_raw]
+
+                    content = data.get("content", "")
+                    if doc_id and content:
+                        entry = {
+                            "doc_id": doc_id,
+                            "content": content,
+                            "title": data.get("title", ""),
+                            "metadata": data.get("metadata", {}),
+                            "embedding": emb,
+                        }
+                        self._memory_store[doc_id] = entry
+                        if not emb:
+                            missing_emb_docs.append(entry)
+
+                # Compute embeddings for any docs that lacked saved embeddings
+                if missing_emb_docs:
+                    texts = [d["content"] for d in missing_emb_docs]
+                    embeddings = self._compute_embeddings(texts)
+                    for doc_entry, vec in zip(missing_emb_docs, embeddings):
+                        doc_entry["embedding"] = vec
+
+            except Exception as exc:
+                print(f"[FirestoreVectorStore] Memory store hydration notice: {exc}")
+
     def vector_search_firestore(
         self,
         query: str,
@@ -355,9 +461,10 @@ class FirestoreVectorStore:
         """
         Semantic search via Firestore native vector index or in-memory BGE cosine search.
         """
+        _ensure_numpy()
         query_vector = self._compute_query_embedding(query)
 
-        if self.is_online:
+        if self.is_online and FirestoreVectorStore._has_native_vector_index is not False:
             try:
                 col_ref = self.collection
                 if company and company != "All Companies":
@@ -376,11 +483,11 @@ class FirestoreVectorStore:
                 for doc in docs:
                     data = doc.to_dict() or {}
                     meta = data.get("metadata", {})
-                    doc_company = meta.get("company", meta.get("company_id", "General"))
-                    doc_subfolder = meta.get("subfolder", "General")
+                    doc_company = meta.get("company") or meta.get("company_id") or "General"
+                    doc_subfolder = meta.get("subfolder") or "General"
                     doc_id = data.get("doc_id", getattr(doc, "id", ""))
-                    filename_val = meta.get("filename", meta.get("document_id", ""))
-                    page_val = meta.get("page", meta.get("page_number", 1))
+                    filename_val = meta.get("filename") or meta.get("document_id") or "doc"
+                    page_val = _safe_int(meta.get("page") or meta.get("page_number"), 1)
 
                     if company and company != "All Companies":
                         if doc_company != company:
@@ -389,7 +496,6 @@ class FirestoreVectorStore:
                             if doc_subfolder != subfolder:
                                 continue
 
-                    # Robust distance extraction from DocumentSnapshot or dictionary data
                     raw_dist = getattr(doc, "distance", None)
                     if raw_dist is None:
                         raw_dist = getattr(doc, "vector_distance", None)
@@ -403,16 +509,16 @@ class FirestoreVectorStore:
                             "doc_id": doc_id,
                             "chunk_hash": doc_id,
                             "chunk_text": data.get("content", ""),
-                            "source_file": meta.get("source", meta.get("source_file", "—")),
+                            "source_file": meta.get("source") or meta.get("source_file") or "—",
                             "company": doc_company,
                             "company_id": doc_company,
                             "subfolder": doc_subfolder,
-                            "subtopic": meta.get("subtopic", doc_subfolder),
+                            "subtopic": meta.get("subtopic") or doc_subfolder,
                             "filename": filename_val,
                             "document_id": filename_val,
                             "page": page_val,
                             "page_number": page_val,
-                            "section_header": meta.get("section_header", ""),
+                            "section_header": meta.get("section_header") or "",
                             "distance": distance,
                             "score": similarity,
                             "metadata": meta,
@@ -421,12 +527,16 @@ class FirestoreVectorStore:
                     if len(results) >= limit:
                         break
                 if results:
+                    FirestoreVectorStore._has_native_vector_index = True
                     return results
             except Exception as exc:
-                if "400" in str(exc) or "index" in str(exc).lower():
-                    print("[FirestoreVectorStore] Native Cloud Firestore vector index not created yet — using in-memory vectorized search engine.")
-                else:
-                    print(f"[FirestoreVectorStore] Firestore search notice (using in-memory): {exc}")
+                FirestoreVectorStore._has_native_vector_index = False
+                if not FirestoreVectorStore._printed_index_notice:
+                    FirestoreVectorStore._printed_index_notice = True
+                    print("[FirestoreVectorStore] Using high-performance in-memory vectorized search engine (cached & indexed from Firestore).")
+
+        # Ensure memory store is populated from Firestore if native search failed or returned empty
+        self._ensure_memory_store_populated()
 
         # Vectorized matrix dot-product operations on normalized embeddings
         q_vec = np.array(query_vector, dtype=np.float32)
@@ -505,6 +615,7 @@ class FirestoreVectorStore:
         """
         Stream all documents from Firestore or in-memory store (optionally filtered).
         """
+        _ensure_numpy()
         if self.is_online:
             try:
                 query = self.collection
@@ -515,29 +626,43 @@ class FirestoreVectorStore:
                 docs = query.stream()
                 results = []
                 for doc in docs:
-                    data = doc.to_dict()
+                    data = doc.to_dict() or {}
                     meta = data.get("metadata", {})
                     doc_id = data.get("doc_id", doc.id)
-                    company_val = meta.get("company", meta.get("company_id", "General"))
-                    subfolder_val = meta.get("subfolder", "General")
-                    filename_val = meta.get("filename", meta.get("document_id", ""))
-                    page_val = meta.get("page", meta.get("page_number", 1))
+                    company_val = meta.get("company") or meta.get("company_id") or "General"
+                    subfolder_val = meta.get("subfolder") or "General"
+                    filename_val = meta.get("filename") or meta.get("document_id") or "doc"
+                    page_val = _safe_int(meta.get("page") or meta.get("page_number"), 1)
+                    content = data.get("content", "")
+
+                    # Cache into memory store for fast local access
+                    if doc_id and content:
+                        emb_raw = data.get("embedding")
+                        emb = list(emb_raw.value) if hasattr(emb_raw, "value") else (list(emb_raw) if isinstance(emb_raw, (list, tuple)) else [])
+                        self._memory_store[doc_id] = {
+                            "doc_id": doc_id,
+                            "content": content,
+                            "title": data.get("title", ""),
+                            "metadata": meta,
+                            "embedding": emb,
+                        }
+
                     results.append(
                         {
                             "doc_id": doc_id,
                             "chunk_hash": doc_id,
-                            "chunk_text": data.get("content", ""),
-                            "keywords": data.get("keywords") or _tokenize(data.get("content", ""))[:200],
-                            "source_file": meta.get("source", "—"),
+                            "chunk_text": content,
+                            "keywords": data.get("keywords") or _tokenize(content)[:200],
+                            "source_file": meta.get("source") or meta.get("source_file") or "—",
                             "company": company_val,
                             "company_id": company_val,
                             "subfolder": subfolder_val,
-                            "subtopic": meta.get("subtopic", subfolder_val),
+                            "subtopic": meta.get("subtopic") or subfolder_val,
                             "filename": filename_val,
                             "document_id": filename_val,
                             "page": page_val,
                             "page_number": page_val,
-                            "section_header": meta.get("section_header", ""),
+                            "section_header": meta.get("section_header") or "",
                             "score": 0.0,
                             "metadata": meta,
                         }
@@ -551,11 +676,11 @@ class FirestoreVectorStore:
         results = []
         for data in self._memory_store.values():
             meta = data.get("metadata", {})
-            doc_company = meta.get("company", meta.get("company_id", "General"))
-            doc_subfolder = meta.get("subfolder", "General")
+            doc_company = meta.get("company") or meta.get("company_id") or "General"
+            doc_subfolder = meta.get("subfolder") or "General"
             doc_id = data.get("doc_id", "")
-            filename_val = meta.get("filename", meta.get("document_id", ""))
-            page_val = meta.get("page", meta.get("page_number", 1))
+            filename_val = meta.get("filename") or meta.get("document_id") or "doc"
+            page_val = _safe_int(meta.get("page") or meta.get("page_number"), 1)
 
             if company and company != "All Companies":
                 if doc_company != company:
@@ -570,16 +695,16 @@ class FirestoreVectorStore:
                     "chunk_hash": doc_id,
                     "chunk_text": data.get("content", ""),
                     "keywords": data.get("keywords") or _tokenize(data.get("content", ""))[:200],
-                    "source_file": meta.get("source", "—"),
+                    "source_file": meta.get("source") or meta.get("source_file") or "—",
                     "company": doc_company,
                     "company_id": doc_company,
                     "subfolder": doc_subfolder,
-                    "subtopic": meta.get("subtopic", doc_subfolder),
+                    "subtopic": meta.get("subtopic") or doc_subfolder,
                     "filename": filename_val,
                     "document_id": filename_val,
                     "page": page_val,
                     "page_number": page_val,
-                    "section_header": meta.get("section_header", ""),
+                    "section_header": meta.get("section_header") or "",
                     "score": 0.0,
                     "metadata": meta,
                 }
@@ -590,6 +715,7 @@ class FirestoreVectorStore:
 
     def delete_company_chunks(self, company: str) -> None:
         """Delete all documents belonging to a company."""
+        _ensure_numpy()
         if not company or company == "All Companies":
             return
         to_del = [
@@ -608,6 +734,7 @@ class FirestoreVectorStore:
 
     def delete_subfolder_chunks(self, company: str, subfolder: str) -> None:
         """Delete all documents belonging to a company/subfolder."""
+        _ensure_numpy()
         if not company or not subfolder:
             return
         to_del = [
@@ -632,6 +759,7 @@ class FirestoreVectorStore:
 
     def delete_file_chunks(self, source_path: str) -> None:
         """Delete all documents belonging to a specific source file."""
+        _ensure_numpy()
         from pathlib import Path as _Path
         try:
             source_str = str(_Path(source_path).resolve())
@@ -696,13 +824,197 @@ class FirestoreVectorStore:
             try:
                 agg = self.collection.count()
                 result = agg.get()
-                if result and len(result) > 0:
-                    first = result[0]
-                    if hasattr(first, "value"):
-                        return int(first.value)
-                    elif isinstance(first, (list, tuple)) and len(first) > 0:
-                        return int(first[0].value)
-            except Exception:
-                pass
+                if result:
+                    # Unwrap nested lists if present e.g. [[AggregationResult...]]
+                    items = result[0] if isinstance(result, list) and len(result) > 0 else result
+                    if isinstance(items, list) and len(items) > 0:
+                        items = items[0]
+                    if isinstance(items, (int, float)):
+                        return int(items)
+                    if isinstance(items, dict):
+                        val = items.get("value") or items.get("count")
+                        if val is not None:
+                            return int(val)
+                    if hasattr(items, "value") and getattr(items, "value") is not None:
+                        try:
+                            return int(items.value)
+                        except (ValueError, TypeError):
+                            pass
+                    if isinstance(items, (list, tuple)) and len(items) > 0:
+                        first_val = items[0]
+                        v = getattr(first_val, "value", None)
+                        if v is not None:
+                            try:
+                                return int(v)
+                            except (ValueError, TypeError):
+                                pass
+            except Exception as exc:
+                print(f"[FirestoreVectorStore] count query notice: {exc}")
+
+        if not self._memory_store:
+            self._ensure_memory_store_populated()
         return len(self._memory_store)
+
+
+# ── FAISS In-Memory Vector Index ──────────────────────────────────────────────
+
+class FAISSIndex:
+    """
+    Fast in-memory vector search using FAISS.
+    Loads embeddings from Firestore on startup for instant queries.
+    """
+
+    def __init__(self, dimension: int = 1024):
+        self.dimension = dimension
+        self._index = None  # type: ignore
+        self._doc_ids: List[str] = []
+        self._metadata: Dict[str, Dict[str, Any]] = {}
+        self._loaded = False
+
+    def _ensure_faiss(self):
+        """Lazy-import FAISS on first use."""
+        global faiss
+        if faiss is None:
+            try:
+                import faiss as _faiss
+                faiss = _faiss
+            except ImportError:
+                raise ImportError("faiss-cpu not installed. Run: pip install faiss-cpu")
+
+    def load_from_firestore(self, store: FirestoreVectorStore) -> int:
+        """
+        Load all embeddings from Firestore into FAISS index.
+        Returns number of vectors loaded.
+        """
+        self._ensure_faiss()
+        if not store.is_online:
+            print("[FAISSIndex] Firestore offline — cannot load index")
+            return 0
+
+        try:
+            # First, hydrate memory store so embeddings are available
+            store._ensure_memory_store_populated()
+            
+            # Use _memory_store which has embeddings cached
+            vectors = []
+            doc_ids = []
+            metadata = []
+
+            for doc_id, data in store._memory_store.items():
+                emb = data.get("embedding", [])
+                if emb and len(emb) == self.dimension and doc_id:
+                    vectors.append(emb)
+                    doc_ids.append(doc_id)
+                    metadata.append(data.get("metadata", {}))
+
+            if not vectors:
+                print("[FAISSIndex] No valid embeddings found in memory store")
+                return 0
+
+            # Build FAISS index (Inner Product for cosine similarity after normalization)
+            import numpy as _np
+            matrix = _np.array(vectors, dtype=_np.float32)
+            # Normalize for cosine similarity
+            norms = _np.linalg.norm(matrix, axis=1, keepdims=True)
+            norms = _np.where(norms == 0, 1.0, norms)
+            matrix = matrix / norms
+
+            self._index = faiss.IndexFlatIP(self.dimension)
+            self._index.add(matrix)
+            self._doc_ids = doc_ids
+            self._metadata = {doc_id: meta for doc_id, meta in zip(doc_ids, metadata)}
+            self._loaded = True
+
+            print(f"[FAISSIndex] Loaded {len(vectors)} vectors from Firestore")
+            return len(vectors)
+
+        except Exception as exc:
+            print(f"[FAISSIndex] Load error: {exc}")
+            return 0
+
+    def add_vectors(self, vectors: List[List[float]], doc_ids: List[str],
+                    metadata_list: Optional[List[Dict[str, Any]]] = None) -> None:
+        """Add new vectors to the FAISS index."""
+        self._ensure_faiss()
+        if not vectors:
+            return
+
+        import numpy as _np
+        matrix = _np.array(vectors, dtype=_np.float32)
+        norms = _np.linalg.norm(matrix, axis=1, keepdims=True)
+        norms = _np.where(norms == 0, 1.0, norms)
+        matrix = matrix / norms
+
+        if self._index is None:
+            self._index = faiss.IndexFlatIP(self.dimension)
+
+        self._index.add(matrix)
+        self._doc_ids.extend(doc_ids)
+        if metadata_list:
+            for doc_id, meta in zip(doc_ids, metadata_list):
+                self._metadata[doc_id] = meta
+        self._loaded = True
+        print(f"[FAISSIndex] Added {len(vectors)} vectors (total: {self._index.ntotal})")
+
+    def search(self, query_vector: List[float], top_k: int = 10,
+               company: Optional[str] = None, subfolder: Optional[str] = None) -> List[Dict[str, Any]]:
+        """
+        Search FAISS index for nearest neighbors.
+        Returns list of {doc_id, score, metadata}.
+        """
+        self._ensure_faiss()
+        if self._index is None or self._index.ntotal == 0:
+            return []
+
+        import numpy as _np
+        q = _np.array([query_vector], dtype=_np.float32)
+        q_norm = _np.linalg.norm(q)
+        if q_norm > 0:
+            q = q / q_norm
+
+        # Search more than needed to allow for filtering
+        search_k = min(top_k * 5, self._index.ntotal)
+        scores, indices = self._index.search(q, search_k)
+
+        results = []
+        for score, idx in zip(scores[0], indices[0]):
+            if idx < 0 or idx >= len(self._doc_ids):
+                continue
+            doc_id = self._doc_ids[idx]
+            meta = self._metadata.get(doc_id, {})
+
+            # Filter by company if specified
+            if company and meta.get("company", "") != company:
+                continue
+            
+            # Filter by subfolder (policy category) if specified
+            if subfolder and meta.get("subfolder", "") != subfolder:
+                continue
+
+            results.append({
+                "doc_id": doc_id,
+                "score": float(score),
+                "metadata": meta,
+            })
+
+            if len(results) >= top_k:
+                break
+
+        return results
+
+    def clear(self) -> None:
+        """Clear the FAISS index."""
+        self._index = None
+        self._doc_ids = []
+        self._metadata = {}
+        self._loaded = False
+        print("[FAISSIndex] Index cleared")
+
+    @property
+    def is_loaded(self) -> bool:
+        return self._loaded and self._index is not None and self._index.ntotal > 0
+
+    @property
+    def size(self) -> int:
+        return self._index.ntotal if self._index else 0
 

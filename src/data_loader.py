@@ -5,6 +5,7 @@ Applies full sanitization via preprocessor.sanitize_chunk() on every chunk.
 Extracts company / subfolder metadata from path structure.
 """
 from __future__ import annotations
+from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -123,3 +124,103 @@ def load_all_documents(data_dir: str = "data") -> List[Any]:
     docs = _load_pdfs(data_path) + _load_txts(data_path) + _load_docx(data_path)
     print(f"[DataLoader] Total loaded: {len(docs)} document chunk(s)")
     return docs
+
+
+# ── In-memory file parsing (for Streamlit uploads) ────────────────────────────
+
+def parse_uploaded_pdf(file_bytes: bytes, filename: str, company: str = "General", subfolder: str = "General") -> List[Any]:
+    """Parse a PDF from raw bytes (in-memory, no disk write)."""
+    from langchain_core.documents import Document
+    docs: List[Any] = []
+    meta_base = {
+        "company": company, "company_id": company,
+        "subfolder": subfolder, "subtopic": subfolder,
+        "filename": filename, "document_id": filename,
+        "source": f"upload://{company}/{subfolder}/{filename}", "source_file": f"upload://{company}/{subfolder}/{filename}",
+        "section_header": "",
+    }
+    try:
+        import fitz
+        pdf = fitz.open(stream=file_bytes, filetype="pdf")
+        for pg_idx, page in enumerate(pdf, start=1):
+            raw_text = page.get_text("text")
+            text = sanitize_chunk(raw_text)
+            if not text or is_junk_chunk(text):
+                continue
+            m = {**meta_base, "page": pg_idx, "page_number": pg_idx}
+            docs.append(Document(page_content=text, metadata=m))
+        pdf.close()
+        print(f"[DataLoader] Parsed PDF '{filename}' in-memory: {len(docs)} chunk(s)")
+    except ImportError:
+        print("[DataLoader] PyMuPDF not available, cannot parse PDF.")
+    except Exception as exc:
+        print(f"[DataLoader] PDF parse error ({filename}): {exc}")
+    return docs
+
+
+def parse_uploaded_txt(file_bytes: bytes, filename: str, company: str = "General", subfolder: str = "General") -> List[Any]:
+    """Parse a TXT file from raw bytes (in-memory, no disk write)."""
+    from langchain_core.documents import Document
+    docs: List[Any] = []
+    meta = {
+        "company": company, "company_id": company,
+        "subfolder": subfolder, "subtopic": subfolder,
+        "filename": filename, "document_id": filename,
+        "source": f"upload://{company}/{subfolder}/{filename}", "source_file": f"upload://{company}/{subfolder}/{filename}",
+        "page": 1, "page_number": 1, "section_header": "",
+    }
+    try:
+        raw = file_bytes.decode("utf-8", errors="ignore")
+        text = sanitize_chunk(raw)
+        if text and not is_junk_chunk(text):
+            docs.append(Document(page_content=text, metadata=meta))
+        print(f"[DataLoader] Parsed TXT '{filename}' in-memory: {len(docs)} chunk(s)")
+    except Exception as exc:
+        print(f"[DataLoader] TXT parse error ({filename}): {exc}")
+    return docs
+
+
+def parse_uploaded_docx(file_bytes: bytes, filename: str, company: str = "General", subfolder: str = "General") -> List[Any]:
+    """Parse a DOCX file from raw bytes (in-memory, no disk write)."""
+    from langchain_core.documents import Document
+    docs: List[Any] = []
+    meta = {
+        "company": company, "company_id": company,
+        "subfolder": subfolder, "subtopic": subfolder,
+        "filename": filename, "document_id": filename,
+        "source": f"upload://{company}/{subfolder}/{filename}", "source_file": f"upload://{company}/{subfolder}/{filename}",
+        "page": 1, "page_number": 1, "section_header": "",
+    }
+    try:
+        import docx2txt
+        raw = docx2txt.process(BytesIO(file_bytes))
+        text = sanitize_chunk(raw)
+        if text and not is_junk_chunk(text):
+            docs.append(Document(page_content=text, metadata=meta))
+        print(f"[DataLoader] Parsed DOCX '{filename}' in-memory: {len(docs)} chunk(s)")
+    except ImportError:
+        print("[DataLoader] docx2txt not available, cannot parse DOCX.")
+    except Exception as exc:
+        print(f"[DataLoader] DOCX parse error ({filename}): {exc}")
+    return docs
+
+
+def parse_uploaded_files(uploaded_files: list, company: str = "General", subfolder: str = "General") -> List[Any]:
+    """
+    Parse multiple uploaded Streamlit files in-memory (no disk writes).
+    Returns a list of LangChain Document objects ready for embedding.
+    """
+    all_docs: List[Any] = []
+    for f in uploaded_files:
+        file_bytes = f.getvalue()
+        fname = f.name.lower()
+        if fname.endswith(".pdf"):
+            all_docs.extend(parse_uploaded_pdf(file_bytes, f.name, company, subfolder))
+        elif fname.endswith(".txt"):
+            all_docs.extend(parse_uploaded_txt(file_bytes, f.name, company, subfolder))
+        elif fname.endswith(".docx"):
+            all_docs.extend(parse_uploaded_docx(file_bytes, f.name, company, subfolder))
+        else:
+            print(f"[DataLoader] Skipping unsupported file type: {f.name}")
+    print(f"[DataLoader] Total parsed from upload: {len(all_docs)} chunk(s) [{company}/{subfolder}]")
+    return all_docs

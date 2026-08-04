@@ -12,17 +12,25 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, List, Optional
 
-import numpy as np
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from rank_bm25 import BM25Okapi
+# Lazy imports — defer heavy libraries until first use
+np = None  # type: ignore
+RecursiveCharacterTextSplitter = None  # type: ignore
+BM25Okapi = None  # type: ignore
+
+
+def _ensure_numpy():
+    global np
+    if np is None:
+        import numpy as _np
+        np = _np
 
 try:
     from .firebase_client import FirestoreVectorStore
-    from .config import BGE_RERANKER_MODEL
+    from .config import BGE_RERANKER_MODEL, CLOUD_ONLY_MODE
     from .preprocessor import sanitize_chunk, is_junk_chunk
 except ImportError:
     from src.firebase_client import FirestoreVectorStore
-    from src.config import BGE_RERANKER_MODEL
+    from src.config import BGE_RERANKER_MODEL, CLOUD_ONLY_MODE
     from src.preprocessor import sanitize_chunk, is_junk_chunk
 
 _RRF_K = 60
@@ -73,7 +81,8 @@ class EmbeddingPipeline:
 
     def chunk_documents(self, langchain_docs: List[Any]) -> List[Any]:
         """Chunk LangChain Document objects and return filtered Document list."""
-        splitter = RecursiveCharacterTextSplitter(chunk_size=self.chunk_size, chunk_overlap=self.chunk_overlap)
+        from langchain_text_splitters import RecursiveCharacterTextSplitter as _Splitter
+        splitter = _Splitter(chunk_size=self.chunk_size, chunk_overlap=self.chunk_overlap)
         from langchain_core.documents import Document
         results = []
         for doc in langchain_docs:
@@ -92,15 +101,17 @@ class EmbeddingPipeline:
 
     def build_bm25_index(self, chunks: List[Dict[str, Any]]) -> None:
         """Build an in-memory BM25 index from sanitized chunks."""
+        from rank_bm25 import BM25Okapi as _BM25
         self._bm25_docs = chunks
         tokenized = [_tokenize(c.get("chunk_text", "")) for c in chunks]
         if any(tokenized):
-            self._bm25 = BM25Okapi(tokenized)
+            self._bm25 = _BM25(tokenized)
         print(f"[EmbeddingPipeline] BM25 index built: {len(chunks)} chunks")
 
     def add_documents(self, langchain_docs: List[Any]) -> None:
         """Chunk LangChain Documents, sanitize, embed, and upsert to Firestore."""
-        splitter = RecursiveCharacterTextSplitter(chunk_size=self.chunk_size, chunk_overlap=self.chunk_overlap)
+        from langchain_text_splitters import RecursiveCharacterTextSplitter as _Splitter
+        splitter = _Splitter(chunk_size=self.chunk_size, chunk_overlap=self.chunk_overlap)
         chunks_to_index: List[Dict[str, Any]] = []
         for doc in langchain_docs:
             splits = splitter.split_text(doc.page_content if hasattr(doc, "page_content") else str(doc))
@@ -142,6 +153,7 @@ class EmbeddingPipeline:
             return []
         tokens = _tokenize(query)
         scores = self._bm25.get_scores(tokens)
+        _ensure_numpy()
         indices = np.argsort(scores)[::-1][:top_k]
         results = []
         for idx in indices:
@@ -176,12 +188,51 @@ class EmbeddingPipeline:
         fused = _reciprocal_rank_fusion([lex, sem])
         return fused[:fusion_top_k]
 
+    # ── Cloud Reranker ───────────────────────────────────────────────────────
+
+    def _rerank_cloud(self, query: str, candidates: List[Dict[str, Any]], top_n: int = 5) -> List[Dict[str, Any]]:
+        """Rerank candidates using HuggingFace Inference API (cross-encoder). No local weights."""
+        import os, requests
+        token = os.getenv("HF_TOKEN", "")
+        if not token:
+            return []
+
+        pairs = [f"{query} [SEP] {c.get('chunk_text', '')[:512]}" for c in candidates]
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+        # Try the reranker model via HF Inference API
+        url = f"https://router.huggingface.co/hf-inference/models/{BGE_RERANKER_MODEL}"
+        try:
+            res = requests.post(url, json={"inputs": pairs}, headers=headers, timeout=2)
+            if res.status_code == 200:
+                data = res.json()
+                if isinstance(data, list) and len(data) == len(candidates):
+                    for doc, score in zip(candidates, data):
+                        if isinstance(score, dict):
+                            doc["reranker_score"] = float(score.get("score", score.get("label", 0)))
+                        else:
+                            doc["reranker_score"] = float(score)
+                    return sorted(candidates, key=lambda d: d.get("reranker_score", 0), reverse=True)[:top_n]
+        except Exception as exc:
+            print(f"[EmbeddingPipeline] Cloud reranker notice: {exc}")
+
+        # Fallback: use semantic similarity as proxy score
+        return sorted(candidates, key=lambda d: d.get("rrf_score", 0), reverse=True)[:top_n]
+
+    # ── Rerank ─────────────────────────────────────────────────────────────
+
     def rerank(
         self, query: str, candidates: List[Dict[str, Any]], top_n: int = 5,
     ) -> List[Dict[str, Any]]:
-        """BGE Reranker V2 M3 cross-encoder scoring."""
+        """Rerank candidates using BGE Reranker V2 M3 cross-encoder scoring."""
         if not candidates:
             return []
+
+        # Cloud-only mode: never load local weights
+        if CLOUD_ONLY_MODE:
+            print("[EmbeddingPipeline] CLOUD_ONLY_MODE — using cloud reranker")
+            return self._rerank_cloud(query, candidates, top_n)
+
         if not self._reranker_loaded:
             try:
                 from FlagEmbedding import FlagReranker
