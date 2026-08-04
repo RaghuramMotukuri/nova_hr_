@@ -423,115 +423,13 @@ st.markdown('</div>', unsafe_allow_html=True)
 # ── Session state ─────────────────────────────────────────────────────────────
 defaults = {
     "retriever": None, "pipeline": None,
-    "chat_history": [], "docs_indexed": 0, "last_result": None,
-    "confirm_del_company": None, "history_loaded": False,
+    "docs_indexed": 0, "last_result": None,
+    "chat_history": [],
+    "confirm_del_company": None,
 }
 for k, v in defaults.items():
     if k not in st.session_state:
         st.session_state[k] = v
-
-
-# ── Conversation History Persistence ──────────────────────────────────────────
-HISTORY_COLLECTION = "chat_history"
-
-
-def _save_history_to_firestore():
-    """Save current chat history to Firestore."""
-    try:
-        from src.config import get_firestore_client, is_firebase_available
-        if not is_firebase_available():
-            return
-        db = get_firestore_client()
-        session_id = st.session_state.get("session_id")
-        if not session_id:
-            import uuid
-            session_id = str(uuid.uuid4())[:16]
-            st.session_state["session_id"] = session_id
-
-        doc_ref = db.collection(HISTORY_COLLECTION).document(session_id)
-        history_data = []
-        for turn in st.session_state.chat_history:
-            result = turn.get("result", {})
-            gen = result.get("generation", {})
-            answers = gen.get("answers", [])
-            best_answer = answers[0].get("answer", "") if answers else result.get("answer", "")
-            history_data.append({
-                "query": turn["query"],
-                "answer": best_answer,
-                "timestamp": turn.get("timestamp"),
-            })
-        doc_ref.set({
-            "session_id": session_id,
-            "history": history_data,
-            "updated_at": __import__("time").time(),
-        }, merge=True)
-    except Exception as exc:
-        print(f"[App] History save notice: {exc}")
-
-
-def _load_history_from_firestore():
-    """Load chat history from Firestore on startup."""
-    try:
-        from src.config import get_firestore_client, is_firebase_available
-        if not is_firebase_available():
-            return []
-        db = get_firestore_client()
-        session_id = st.session_state.get("session_id")
-        if not session_id:
-            return []
-
-        doc = db.collection(HISTORY_COLLECTION).document(session_id).get()
-        if doc.exists:
-            data = doc.to_dict() or {}
-            history = data.get("history", [])
-            print(f"[App] Loaded {len(history)} history turns from Firestore")
-            return history
-    except Exception as exc:
-        print(f"[App] History load notice: {exc}")
-    return []
-
-
-def _build_conversation_context() -> str:
-    """Build context string from recent conversation history for follow-up questions."""
-    history = st.session_state.chat_history
-    if not history:
-        return ""
-
-    context_parts = []
-    for turn in history[-5:]:
-        query = turn.get("query", "")
-        result = turn.get("result", {})
-        gen = result.get("generation", {})
-        answers = gen.get("answers", [])
-        answer = answers[0].get("answer", "") if answers else result.get("answer", "")
-        if query and answer:
-            context_parts.append(f"Employee: {query}")
-            context_parts.append(f"HR: {answer[:500]}")
-
-    if context_parts:
-        return "Previous conversation:\n" + "\n".join(context_parts) + "\n\n"
-    return ""
-
-
-# Generate session ID and load history on first load
-if "session_id" not in st.session_state:
-    import uuid
-    st.session_state["session_id"] = str(uuid.uuid4())[:16]
-
-if not st.session_state.history_loaded:
-    saved_history = _load_history_from_firestore()
-    if saved_history:
-        for turn in saved_history:
-            st.session_state.chat_history.append({
-                "query": turn.get("query", ""),
-                "result": {
-                    "generation": {"answers": [{"answer": turn.get("answer", "")}]},
-                    "answer": turn.get("answer", ""),
-                },
-                "timestamp": turn.get("timestamp"),
-            })
-        print(f"[App] Restored {len(saved_history)} conversation turns")
-    st.session_state.history_loaded = True
 
 
 # ── Cached resources ──────────────────────────────────────────────────────────
@@ -554,8 +452,38 @@ def get_retriever():
             print(f"[App] FAISS index loaded: {count} vectors")
         except Exception as exc:
             print(f"[App] FAISS load notice: {exc}")
+        
+        # Pre-build BM25 index from Firestore for instant search
+        try:
+            all_chunks = pipeline.vector_store.get_all_documents()
+            if all_chunks:
+                pipeline.build_bm25_index(all_chunks)
+                print(f"[App] BM25 index pre-built: {len(all_chunks)} chunks")
+        except Exception as exc:
+            print(f"[App] BM25 pre-build notice: {exc}")
     
     return retriever
+
+
+def _preload_local_model():
+    """Pre-load local model in background thread for instant first query."""
+    import threading
+    def _load():
+        try:
+            from src.generator import LLMGenerator
+            gen = LLMGenerator()
+            gen._load_local_model("Qwen/Qwen2.5-0.5B-Instruct")
+            print("[App] Local model pre-loaded successfully")
+        except Exception as exc:
+            print(f"[App] Model pre-load notice: {exc}")
+    thread = threading.Thread(target=_load, daemon=True)
+    thread.start()
+
+
+# Pre-load local model on startup (background thread)
+if "model_preloaded" not in st.session_state:
+    st.session_state.model_preloaded = True
+    _preload_local_model()
 
 
 @st.cache_data(show_spinner=False, ttl=300)
@@ -661,10 +589,24 @@ with st.sidebar:
     st.markdown('<div class="sidebar-section">', unsafe_allow_html=True)
     st.markdown('<div class="sidebar-section-title">🆕 New Chat</div>', unsafe_allow_html=True)
     if st.button("➕ Start New Conversation", key="new_chat_btn", use_container_width=True):
-        st.session_state.chat_history = []
         st.session_state.last_result = None
         st.success("Started a new conversation.")
         st.rerun()
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    # Online / Offline Mode Toggle
+    st.markdown('<div class="sidebar-section">', unsafe_allow_html=True)
+    st.markdown('<div class="sidebar-section-title">🌐 Connection Mode</div>', unsafe_allow_html=True)
+    online_mode = st.toggle(
+        "Online Mode (Cloud API)",
+        value=True,
+        key="online_mode_toggle",
+        help="ON = Cloud API (HuggingFace). OFF = Local model (no internet needed).",
+    )
+    if online_mode:
+        st.markdown('<span class="status-badge status-online">● Online — Cloud API</span>', unsafe_allow_html=True)
+    else:
+        st.markdown('<span class="status-badge status-offline">● Offline — Local Model</span>', unsafe_allow_html=True)
     st.markdown("</div>", unsafe_allow_html=True)
 
     # Firebase status
@@ -694,19 +636,28 @@ with st.sidebar:
     st.markdown('<div class="sidebar-section-title">🤖 AI Model Settings</div>', unsafe_allow_html=True)
     from src.generator import HF_MODELS, DEFAULT_HF_MODEL
 
-    model_keys   = list(HF_MODELS.keys())
-    model_labels = [f"{HF_MODELS[m]['icon']} {HF_MODELS[m]['label']}" for m in model_keys]
-    default_idx  = model_keys.index(DEFAULT_HF_MODEL) if DEFAULT_HF_MODEL in model_keys else 0
+    if online_mode:
+        model_keys   = list(HF_MODELS.keys())
+        model_labels = [f"{HF_MODELS[m]['icon']} {HF_MODELS[m]['label']}" for m in model_keys]
+        default_idx  = model_keys.index(DEFAULT_HF_MODEL) if DEFAULT_HF_MODEL in model_keys else 0
 
-    selected_label = st.selectbox(
-        "HF Model", model_labels, index=default_idx, key="model_select", label_visibility="collapsed"
-    )
-    selected_model = model_keys[model_labels.index(selected_label)]
+        selected_label = st.selectbox(
+            "HF Model", model_labels, index=default_idx, key="model_select", label_visibility="collapsed"
+        )
+        selected_model = model_keys[model_labels.index(selected_label)]
 
-    model_desc = HF_MODELS.get(selected_model, {}).get("description", "")
-    if model_desc:
-        st.markdown(f"<div style='font-size:0.72rem;color:#64748b;margin-top:0.25rem;'>{model_desc}</div>",
-                    unsafe_allow_html=True)
+        model_desc = HF_MODELS.get(selected_model, {}).get("description", "")
+        if model_desc:
+            st.markdown(f"<div style='font-size:0.72rem;color:#64748b;margin-top:0.25rem;'>{model_desc}</div>",
+                        unsafe_allow_html=True)
+    else:
+        selected_model = "Qwen/Qwen2.5-0.5B-Instruct"
+        st.markdown(
+            "<div style='font-size:0.85rem;color:#10b981;margin-top:0.25rem;'>"
+            "🚀 <b>Qwen2.5-0.5B</b> — Fastest local model (~1GB download once)"
+            "</div>",
+            unsafe_allow_html=True,
+        )
 
     rag_mode = st.radio(
         "RAG Mode",
@@ -720,12 +671,7 @@ with st.sidebar:
         key="rag_mode_radio",
     )
 
-    use_local = st.toggle(
-        "Use Local Transformers",
-        value=False,
-        key="local_engine",
-        help="Run locally via transformers (no cloud API needed).",
-    )
+    use_local = not online_mode
     st.markdown("</div>", unsafe_allow_html=True)
 
     # Search params
@@ -844,7 +790,7 @@ with st.sidebar:
     st.metric("Indexed Chunks", st.session_state.docs_indexed)
     if st.button("🗑️ Clear Chat", key="clear_chat", use_container_width=True):
         st.session_state.chat_history = []
-        st.session_state.last_result  = None
+        st.session_state.last_result = None
         st.rerun()
     st.markdown("</div>", unsafe_allow_html=True)
 
@@ -868,13 +814,13 @@ def render_chunks(tab, chunks, max_n=10):
 
 # ── Sticky Tab Strip ─────────────────────────────────────────────────────────
 st.markdown('<div class="sticky-tabs">', unsafe_allow_html=True)
-tab_search, tab_history, tab_docs = st.tabs(["🔍 Search", "🕘 History", "📚 Documents"])
+tab_search, tab_docs = st.tabs(["🔍 Search", "📚 Documents"])
 st.markdown('</div>', unsafe_allow_html=True)
 
 
 # ── Search tab (Chat Interface) ────────────────────────────────────────────────
 with tab_search:
-    # Render full chat history
+    # Render chat history
     for turn in st.session_state.chat_history:
         # User message
         with st.chat_message("user", avatar="🧑"):
@@ -884,16 +830,11 @@ with tab_search:
         result = turn["result"]
         gen = result.get("generation", {})
         answers = gen.get("answers", [])
-        citations = gen.get("citations", [])
         is_multi_company = gen.get("multi_company", False)
 
         with st.chat_message("assistant", avatar="🤖"):
             if is_multi_company:
-                # ── Multi-Company Comparison Format ────────────────────────
                 companies = gen.get("companies", [])
-                company_groups = gen.get("company_groups", {})
-                
-                # Multi-company badge
                 company_tags = " ".join([
                     f'<span class="company-tag">{c}</span>' for c in companies[:5]
                 ])
@@ -902,74 +843,40 @@ with tab_search:
                     f'<div style="margin: 0.5rem 0;">{company_tags}</div>',
                     unsafe_allow_html=True,
                 )
-                
-                # Render each section with specific styling
                 for ans in answers:
                     bc = ans.get("badge_color", "#6366f1")
                     icon = ans.get("icon", "🤖")
                     label = ans.get("label", "Policy Processor")
-                    section_type = ans.get("section_type", "general")
                     raw_text = ans.get("answer", "")
-                    # Add line breaks at sentence boundaries
                     text = _highlight_companies(raw_text, companies)
                     rgb = _hex_to_rgb(bc)
-                    
-                    # Use specific CSS class based on section type
                     card_class = {
                         "general": "multi-company-general",
                         "differences": "multi-company-diff",
                         "summary": "multi-company-summary",
-                    }.get(section_type, "answer-card")
-                    
-                    # Escape HTML then apply company highlighting
+                    }.get(ans.get("section_type", "general"), "answer-card")
                     import html as html_mod
                     safe_text = html_mod.escape(text)
                     safe_text = _apply_company_highlight_html(safe_text, companies)
-                    
                     st.markdown(f"""
 <div class="{card_class}">
     <div class="answer-card-header">
         <span style="font-size:1.2rem;">{icon}</span>
-        <span class="provider-badge"
-              style="background:rgba({rgb},0.15);color:{bc};border:1px solid {bc}40;">
-            {label}
-        </span>
+        <span class="provider-badge" style="background:rgba({rgb},0.15);color:{bc};border:1px solid {bc}40;">{label}</span>
     </div>
     <div class="answer-text">{safe_text}</div>
 </div>""", unsafe_allow_html=True)
-                
-                # Company groups in expandable sections
-                if company_groups:
-                    with st.expander("🏢 Company Policy Details", expanded=False):
-                        for company, comp_chunks in company_groups.items():
-                            st.markdown(f"**{company}**")
-                            for chunk in comp_chunks[:2]:
-                                chunk_text = chunk.get("chunk_text", "")[:500]
-                                st.markdown(f"""
-<div class="citation-card">
-    <div style="font-size:0.82rem;color:#94a3b8;">
-        {chunk.get('filename', 'Policy')} — p.{chunk.get('page_number', '')}
-    </div>
-    <div style="font-size:0.85rem;margin-top:0.4rem;">{chunk_text}</div>
-</div>""", unsafe_allow_html=True)
-                            st.markdown("---")
-            
             else:
-                # ── Standard Single-Company Format ────────────────────────
-                # Get company names for highlighting
                 _all_companies = []
                 if data_path.exists():
                     _all_companies = sorted([d.name for d in data_path.iterdir() if d.is_dir()])
-
                 for ans in answers:
                     bc = ans.get("badge_color", "#6366f1")
                     icon = ans.get("icon", "🤖")
                     label = ans.get("label", "Policy Processor")
                     raw_text = ans.get("answer", "")
-                    # Add line breaks at sentence boundaries
                     text = _highlight_companies(raw_text, _all_companies)
                     rgb = _hex_to_rgb(bc)
-                    # Escape HTML then apply company highlighting
                     import html as html_mod
                     safe_text = html_mod.escape(text)
                     safe_text = _apply_company_highlight_html(safe_text, _all_companies)
@@ -977,107 +884,25 @@ with tab_search:
 <div class="answer-card">
     <div class="answer-card-header">
         <span style="font-size:1.2rem;">{icon}</span>
-        <span class="provider-badge"
-              style="background:rgba({rgb},0.15);color:{bc};border:1px solid {bc}40;">
-            {label}
-        </span>
+        <span class="provider-badge" style="background:rgba({rgb},0.15);color:{bc};border:1px solid {bc}40;">{label}</span>
     </div>
     <div class="answer-text">{safe_text}</div>
 </div>""", unsafe_allow_html=True)
 
-            if result.get("mode") == "bm25_only":
-                st.markdown(
-                    '<span class="status-badge status-warning">'
-                    "⚠️ BM25-only — Configure Firebase for full semantic search"
-                    "</span>",
-                    unsafe_allow_html=True,
-                )
+        if result.get("mode") in ("bm25_only", "fast"):
+            st.markdown(
+                '<span class="status-badge status-ok">'
+                "✅ Search complete"
+                "</span>",
+                unsafe_allow_html=True,
+            )
 
-            # Detailed retrieval results
-            with st.expander("🔍 Detailed Results", expanded=False):
-                detail_r, detail_l, detail_s = st.tabs(["🔀 Reranked", "🔤 Lexical", "🔵 Semantic"])
-                render_chunks(detail_r, result.get("reranked", []))
-                render_chunks(detail_l, result.get("lexical", []))
-                render_chunks(detail_s, result.get("semantic", []))
-
-
-# ── History tab (all conversations) ───────────────────────────────────────────
-with tab_history:
-    st.markdown("### 🕘 Conversation History")
-    history = st.session_state.chat_history
-    if not history:
-        st.info("No conversations yet. Ask a question from the Search tab.")
-    else:
-        st.caption(f"{len(history)} saved question(s) in this conversation.")
-        for i, turn in enumerate(reversed(history)):
-            with st.expander(f"#{len(history) - i} — {turn['query'][:70]}{'…' if len(turn['query']) > 70 else ''}", expanded=False):
-                st.markdown(f"**❓ {turn['query']}**")
-                st.markdown("---")
-                result = turn["result"]
-                gen = result.get("generation", {})
-                answers = gen.get("answers", [])
-                citations = gen.get("citations", [])
-                is_multi_company = gen.get("multi_company", False)
-
-                if is_multi_company:
-                    companies = gen.get("companies", [])
-                    company_tags = " ".join([
-                        f'<span class="company-tag">{c}</span>' for c in companies[:5]
-                    ])
-                    st.markdown(
-                        f'<div class="multi-company-badge">📊 Comparing {len(companies)} companies</div>'
-                        f'<div style="margin: 0.5rem 0;">{company_tags}</div>',
-                        unsafe_allow_html=True,
-                    )
-
-                for ans in answers:
-                    bc = ans.get("badge_color", "#6366f1")
-                    icon = ans.get("icon", "🤖")
-                    label = ans.get("label", "Policy Processor")
-                    section_type = ans.get("section_type", "general")
-                    raw_text = ans.get("answer", "")
-                    # Get company names for highlighting
-                    _hist_companies = companies if is_multi_company else (
-                        sorted([d.name for d in data_path.iterdir() if d.is_dir()])
-                        if data_path.exists() else []
-                    )
-                    # Add line breaks at sentence boundaries
-                    text = _highlight_companies(raw_text, _hist_companies)
-                    rgb = _hex_to_rgb(bc)
-                    
-                    card_class = {
-                        "general": "multi-company-general",
-                        "differences": "multi-company-diff",
-                        "summary": "multi-company-summary",
-                    }.get(section_type, "answer-card") if is_multi_company else "answer-card"
-                    
-                    # Escape HTML then apply company highlighting
-                    import html as html_mod
-                    safe_text = html_mod.escape(text)
-                    safe_text = _apply_company_highlight_html(safe_text, _hist_companies)
-                    st.markdown(f"""
-<div class="{card_class}">
-    <div class="answer-card-header">
-        <span style="font-size:1.2rem;">{icon}</span>
-        <span class="provider-badge"
-              style="background:rgba({rgb},0.15);color:{bc};border:1px solid {bc}40;">
-            {label}
-        </span>
-    </div>
-    <div class="answer-text">{safe_text}</div>
-</div>""", unsafe_allow_html=True)
-
-                with st.expander("🔍 Detailed Results", expanded=False):
-                    detail_r, detail_l, detail_s = st.tabs(["🔀 Reranked", "🔤 Lexical", "🔵 Semantic"])
-                    render_chunks(detail_r, result.get("reranked", []))
-                    render_chunks(detail_l, result.get("lexical", []))
-                    render_chunks(detail_s, result.get("semantic", []))
-
-                if st.button("🗑️ Delete", key=f"hist_del_{i}", use_container_width=True):
-                    del st.session_state.chat_history[len(history) - 1 - i]
-                    if not st.session_state.chat_history:
-                        st.session_state.last_result = None
-                    st.rerun()
+        # Detailed retrieval results
+        with st.expander("🔍 Detailed Results", expanded=False):
+            detail_r, detail_l, detail_s = st.tabs(["🔀 Reranked", "🔤 Lexical", "🔵 Semantic"])
+            render_chunks(detail_r, result.get("reranked", []))
+            render_chunks(detail_l, result.get("lexical", []))
+            render_chunks(detail_s, result.get("semantic", []))
 
 
 # ── Documents tab ─────────────────────────────────────────────────────────────
@@ -1277,28 +1102,28 @@ with st.bottom:
     )
     
     if user_query:
-        with st.spinner("Searching policy documents..."):
+        with st.spinner("🔍 Searching documents..."):
             try:
                 with Timer("Total query") as t_total:
                     retriever = get_retriever()
-                    # Build conversation context for follow-up questions
-                    conv_context = _build_conversation_context()
+                    t_prep = time.perf_counter()
                     company_arg = None if selected_company == "All Companies" else selected_company
                     
                     # Auto-detect policy category from query for targeted search
                     detected_subfolder = _detect_policy_category(user_query)
                     if detected_subfolder:
                         print(f"[App] Detected policy category: {detected_subfolder}")
+                    print(f"[Timer] Prep: {time.perf_counter() - t_prep:.3f}s")
                     
                     # Fast mode: reduce search scope for speed
                     if rag_mode == "fast":
+                        fast_top_k = min(top_k, 2)
+                        fast_rerank = min(rerank_top_n, 2)
+                        fast_semantic = 5
+                    else:
                         fast_top_k = min(top_k, 3)
                         fast_rerank = min(rerank_top_n, 3)
                         fast_semantic = 10
-                    else:
-                        fast_top_k = top_k
-                        fast_rerank = rerank_top_n
-                        fast_semantic = 20
                     
                     result = retriever.search(
                         query=user_query,
@@ -1310,12 +1135,9 @@ with st.bottom:
                         rag_mode=rag_mode,
                         hf_model=selected_model,
                         use_local_engine=use_local,
-                        conversation_context=conv_context,
                     )
                 st.session_state.last_result = result
                 st.session_state.chat_history.append({"query": user_query, "result": result})
-                # Save to Firestore
-                _save_history_to_firestore()
                 st.rerun()
             except Exception as exc:
                 st.error(f"Search error: {exc}")

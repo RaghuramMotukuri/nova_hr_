@@ -34,13 +34,18 @@ except ImportError:
 
 HF_MODELS: Dict[str, Dict[str, str]] = {
     "Qwen/Qwen2.5-3B-Instruct": {
-        "label": "Qwen-2.5-3B-Instruct (Local)", "icon": "⚡",
-        "description": "Local — 3B CausalLM, high-accuracy conversational generative model (Default)",
+        "label": "Qwen-2.5-3B-Instruct (Cloud)", "icon": "☁️",
+        "description": "Cloud — 3B CausalLM, high-accuracy conversational model",
+        "engine": "causal_lm",
+    },
+    "Qwen/Qwen2.5-1.5B-Instruct": {
+        "label": "Qwen-2.5-1.5B-Instruct (Local)", "icon": "⚡",
+        "description": "Local — 1.5B CausalLM, balanced speed/quality (~3GB download once)",
         "engine": "causal_lm",
     },
     "Qwen/Qwen2.5-0.5B-Instruct": {
-        "label": "Qwen-2.5-0.5B-Instruct (Local)", "icon": "⚡",
-        "description": "Local — Tiny 0.5B CausalLM, ultra-fast generative model",
+        "label": "Qwen-2.5-0.5B-Instruct (Local Fast)", "icon": "🚀",
+        "description": "Local — 0.5B CausalLM, fastest model (~1GB download once)",
         "engine": "causal_lm",
     },
     "deepset/roberta-base-squad2": {
@@ -55,7 +60,7 @@ HF_MODELS: Dict[str, Dict[str, str]] = {
     },
 }
 
-DEFAULT_HF_MODEL = "deepset/roberta-base-squad2"
+DEFAULT_HF_MODEL = "Qwen/Qwen2.5-3B-Instruct"
 
 _PROVIDERS = {
     "hf_hybrid":  {"label": "HF Hybrid RAG",   "icon": "🔀", "badge_color": "#38bdf8", "badge_bg": "rgba(56,189,248,0.12)", "border": "#38bdf8"},
@@ -120,16 +125,17 @@ def _build_company_comparison_prompt(
     all_context = "\n\n".join(company_contexts)
 
     prompt = (
-        f"You are a warm, helpful HR colleague comparing policies across companies: {scope}.\n\n"
+        f"You are a friendly HR representative comparing policies across companies: {scope}.\n\n"
         f"An employee asked: {query}\n\n"
-        f"POLICY EXCERPTS:\n{all_context}\n\n"
+        f"Here are the relevant policy excerpts:\n{all_context}\n\n"
         f"How to respond:\n"
-        f"1. Write like you're talking to a friend — warm, natural, conversational.\n"
-        f"2. Weave the comparison into your explanation. Like: 'At TCS you get X, but Infosys offers Y.'\n"
-        f"3. Bold key terms naturally: **26 weeks**, **5 lakh coverage**, **60 days notice**.\n"
-        f"4. Start new points on new lines.\n"
-        f"5. No robotic phrases. No 'The document states...'.\n"
-        f"6. Only use tables or lists if the user specifically asks for them."
+        f"- Talk like a helpful colleague, not a policy manual\n"
+        f"- Start with a quick summary of the main differences\n"
+        f"- Use a table to compare side-by-side (companies as columns)\n"
+        f"- Bold key terms: **26 weeks**, **5 lakh coverage**, **60 days notice**\n"
+        f"- Keep bullet points short and scannable\n"
+        f"- End with a practical takeaway or recommendation\n"
+        f"- No robotic phrases like 'The document states...' or 'According to policy...'"
     )
     return prompt
 
@@ -293,18 +299,29 @@ def _is_out_of_scope(query: str, context: str) -> bool:
 
 def _build_system_prompt(scope: str) -> str:
     return (
-        f"You are a friendly, helpful HR colleague explaining company policy for {scope} directly to an employee.\n\n"
-        "### HOW TO RESPOND\n"
-        "Write like you're talking to a friend at work. Be warm, clear, and natural.\n\n"
-        "Rules:\n"
-        "1. Conversational Tone: Write like a real person talking, not a document. Use simple, friendly language.\n"
-        "2. Natural Flow: One idea flows into the next. No bullet points, no tables, no headers unless specifically asked.\n"
-        "3. Bold key terms naturally: **5 lakh coverage**, **26 weeks maternity**, **60 days notice period**.\n"
-        "4. Start new points on new lines for readability.\n"
-        "5. If comparing two things, weave the comparison into your explanation naturally. Like: 'TCS gives you 26 weeks of maternity leave, while Infosys offers 24 weeks.'\n"
-        "6. No robotic phrases: Never say 'The document states', 'According to policy', or 'As per the guidelines'.\n"
-        "7. Be helpful: Add context that helps the employee understand, like what applies to them.\n\n"
-        "Only use tables, lists, or structured formats if the user specifically asks for them."
+        f"You are a friendly HR representative helping employees at {scope} understand their benefits and policies.\n\n"
+        "## How to answer\n\n"
+        "Talk to the employee like a helpful colleague would — warm, clear, and direct. "
+        "Imagine you're having a quick chat by the coffee machine, not reading from a policy manual.\n\n"
+        "**Style:**\n"
+        "- Use a natural, conversational tone — not robotic or formal\n"
+        "- Get straight to the point — employees want quick answers, not essays\n"
+        "- Use everyday language, not legal jargon\n"
+        "- If something is complex, break it down simply\n"
+        "- Use **bold** for key facts like dates, amounts, or deadlines\n\n"
+        "**Format:**\n"
+        "- For simple questions: a short paragraph is enough\n"
+        "- For lists: use bullet points\n"
+        "- For comparisons: use a table with companies as columns\n"
+        "- For step-by-step processes: number the steps\n"
+        "- Keep it scannable — employees skim, they don't read every word\n\n"
+        "**What NOT to do:**\n"
+        "- Never say 'According to the policy document' or 'The document states'\n"
+        "- Don't over-explain simple things\n"
+        "- Don't hedge with 'it depends' when there's a clear answer\n"
+        "- Don't dump the entire policy — give the relevant bits\n\n"
+        "**If you don't know:**\n"
+        "Say 'I don't have that information in the documents I've been given' and suggest who they could ask."
     )
 
 
@@ -396,7 +413,7 @@ def _process_context_to_natural_prose(
     return clean_conversational_response(prose)
 
 
-def _format_context(chunks: List[Dict[str, Any]], max_chunks: int = 3, max_chars_per_chunk: int = 800) -> tuple[str, List[Dict[str, Any]]]:
+def _format_context(chunks: List[Dict[str, Any]], max_chunks: int = 1, max_chars_per_chunk: int = 300) -> tuple[str, List[Dict[str, Any]]]:
     """Format top chunks into clean, concise reference blocks for ultra-fast LLM prompts."""
     blocks: List[str] = []
     citations: List[Dict[str, Any]] = []
@@ -510,7 +527,7 @@ class LLMGenerator:
             system_prompt = _build_system_prompt(scope)
             messages = [
                 {"role": "system", "content": system_prompt},
-                {"role": "user",   "content": f"Context:\n{context[:1500]}\n\nQuestion: {query}" if context else query},
+                {"role": "user",   "content": f"Context:\n{context[:400]}\n\nQuestion: {query}" if context else query},
             ]
             encoded = self._local_tokenizer.apply_chat_template(
                 messages,
@@ -536,7 +553,7 @@ class LLMGenerator:
 
             pad_id = getattr(self._local_tokenizer, "pad_token_id", None) or getattr(self._local_tokenizer, "eos_token_id", None)
             gen_kwargs: Dict[str, Any] = {
-                "max_new_tokens": min(max_new_tokens, 512),
+                "max_new_tokens": min(max_new_tokens, 128),
                 "do_sample": False,
                 "use_cache": True,
             }
@@ -698,13 +715,16 @@ class LLMGenerator:
 
             # Flan-T5 works best with a friendly conversational instruction prefix
             prompt = (
-                f"You are a friendly HR representative speaking directly to an employee.\n"
-                f"Answer the employee's question based only on the context provided.\n"
-                f"Match the user's requested format — table, list, comparison, or paragraph.\n"
-                f"If the answer is not in the context, politely state that it was not found.\n\n"
+                f"You are a friendly HR representative at the company.\n"
+                f"Answer the employee's question naturally and helpfully.\n"
+                f"Use everyday language, not legal jargon.\n"
+                f"If comparing options, use a table.\n"
+                f"If listing benefits, use bullet points.\n"
+                f"Bold key facts like dates, amounts, or deadlines.\n"
+                f"If the answer isn't in the context, politely say so.\n\n"
                 f"Context: {context[:2048]}\n\n"
                 f"Question: {query}\n\n"
-                f"Response:"
+                f"Answer:"
             )
             inputs = s2s_tokenizer(
                 prompt, return_tensors="pt", truncation=True, max_length=512,
@@ -772,7 +792,7 @@ class LLMGenerator:
                 {"role": "system", "content": system_prompt},
                 {"role": "user",   "content": user_content},
             ],
-            "max_tokens": 1024,
+            "max_tokens": 384,
             "temperature": 0.0,
         }
         headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
@@ -795,7 +815,7 @@ class LLMGenerator:
             for url in endpoints:
                 try:
                     import requests
-                    res = requests.post(url, json=payload, headers=headers, timeout=5)
+                    res = requests.post(url, json=payload, headers=headers, timeout=120)
                     if res.status_code == 200:
                         data = res.json()
                         if data.get("choices"):
@@ -886,9 +906,9 @@ class LLMGenerator:
         For "All Companies" mode (company=None), generates a structured
         multi-company comparison with general answer, differences, and summary.
         """
-        if CLOUD_ONLY_MODE and use_local_engine:
-            print("[LLMGenerator] CLOUD_ONLY_MODE enabled — forcing cloud API (no local weights)")
-            use_local_engine = False
+        # If use_local_engine is True, force local mode regardless of CLOUD_ONLY_MODE
+        if use_local_engine:
+            print("[LLMGenerator] Offline mode — using local model")
 
         clean_query = sanitize_query(query)
         active_chunks = chunks or semantic_chunks or lexical_chunks or []

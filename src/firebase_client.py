@@ -179,7 +179,7 @@ class FirestoreVectorStore:
             
             headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
             url = "https://router.huggingface.co/hf-inference/models/BAAI/bge-large-en-v1.5"
-            res = requests.post(url, json={"inputs": text}, headers=headers, timeout=3)
+            res = requests.post(url, json={"inputs": text}, headers=headers, timeout=120)
             if res.status_code == 200:
                 vec = res.json()
                 if isinstance(vec, list) and len(vec) == 1024:
@@ -192,19 +192,60 @@ class FirestoreVectorStore:
             print(f"[FirestoreVectorStore] Cloud embedding notice: {exc}")
         return []
 
-    def _compute_embeddings(self, texts: List[str]) -> List[List[float]]:
-        """Return a list of 1024-dim float lists using HF Cloud Feature Extraction API (no local downloading)."""
+    def _call_hf_cloud_embedding_batch(self, texts: List[str]) -> List[List[float]]:
+        """Compute embeddings for multiple texts in a single API call (much faster)."""
+        _ensure_numpy()
         if not texts:
             return []
+        try:
+            import requests, os
+            token = os.getenv("HF_TOKEN", "")
+            if not token:
+                from src.generator import LLMGenerator
+                token = LLMGenerator()._get_hf_token()
+            
+            headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+            url = "https://router.huggingface.co/hf-inference/models/BAAI/bge-large-en-v1.5"
+            # Batch API: send all texts at once
+            res = requests.post(url, json={"inputs": texts}, headers=headers, timeout=120)
+            if res.status_code == 200:
+                data = res.json()
+                if isinstance(data, list) and len(data) == len(texts):
+                    results = []
+                    for vec in data:
+                        if isinstance(vec, list) and len(vec) == 1024:
+                            arr = np.array(vec, dtype=np.float32)
+                            norm = np.linalg.norm(arr)
+                            if norm > 0:
+                                arr = arr / norm
+                            results.append(arr.tolist())
+                        else:
+                            results.append([0.0] * EMBEDDING_DIM)
+                    return results
+        except Exception as exc:
+            print(f"[FirestoreVectorStore] Batch embedding notice: {exc}")
+        # Fallback: one by one
+        return [self._call_hf_cloud_embedding(t) for t in texts]
+
+    def _compute_embeddings(self, texts: List[str]) -> List[List[float]]:
+        """Return a list of 1024-dim float lists using HF Cloud Feature Extraction API (batch for speed)."""
+        if not texts:
+            return []
+        
+        # Use batch API for multiple texts (much faster)
+        if len(texts) > 1:
+            results = self._call_hf_cloud_embedding_batch(texts)
+            if results and any(any(x != 0.0 for x in v) for v in results):
+                return results
+        
+        # Fallback: one by one
         results = []
         for text in texts:
             vec = self._call_hf_cloud_embedding(text)
             if not vec:
                 if CLOUD_ONLY_MODE:
-                    print("[FirestoreVectorStore] CLOUD_ONLY_MODE — cloud embedding failed, returning zero vector")
                     vec = [0.0] * EMBEDDING_DIM
                 else:
-                    # Fallback to local model only if cloud API unavailable
                     vec = self.model.encode([text], show_progress_bar=False, convert_to_numpy=True)[0].tolist()
             results.append(vec)
         return results
